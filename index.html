@@ -1,0 +1,4067 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mi Cartera — Portfolio Manager</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📈</text></svg>">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #f5f6f8; font-family: 'DM Sans', 'Segoe UI', 'Helvetica Neue', sans-serif; }
+    @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.4} }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)} }
+    .row:hover { background: #f0f1f4 !important; }
+    input:focus, select:focus { border-color: #059669 !important; outline: none; box-shadow: 0 0 0 3px rgba(5,150,105,0.08); }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-thumb { background: #e2e5ea; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+var useState=React.useState,useEffect=React.useEffect,useRef=React.useRef,useCallback=React.useCallback;
+function _extends() { return _extends = Object.assign ? Object.assign.bind() : function (n) { for (var e = 1; e < arguments.length; e++) { var t = arguments[e]; for (var r in t) ({}).hasOwnProperty.call(t, r) && (n[r] = t[r]); } return n; }, _extends.apply(null, arguments); }
+// ─── UTILS ───────────────────────────────────────────────────────────
+const fmt = (n, d = 2) => {
+  if (n == null || isNaN(n)) return "—";
+  return new Intl.NumberFormat("es-ES", {
+    minimumFractionDigits: d,
+    maximumFractionDigits: d
+  }).format(n);
+};
+const fmtEur = n => isNaN(n) ? "—" : `${fmt(n)} €`;
+const fmtPct = n => isNaN(n) ? "—" : `${n >= 0 ? "+" : ""}${fmt(n)}%`;
+const pctChange = (c, p) => p === 0 ? 0 : (c - p) / p * 100;
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+// ─── PRICE SERVICE (via Cloudflare Worker proxy) ─────────────────────
+// The proxy URL points to your Cloudflare Worker.
+// Change this to your actual worker URL after deploying.
+const PROXY_BASE = "https://finnhub-proxy.TU-USUARIO.workers.dev";
+async function finnhubQuote(symbol, proxyUrl) {
+  const base = proxyUrl || PROXY_BASE;
+  const res = await fetch(`${base}/quote?symbol=${encodeURIComponent(symbol)}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const d = await res.json();
+  if (d.error) throw new Error(d.error);
+  if (d.c === 0 && d.h === 0 && d.l === 0) throw new Error("No data");
+  return {
+    current: d.c,
+    high: d.h,
+    low: d.l,
+    open: d.o,
+    prevClose: d.pc,
+    change: d.d,
+    changePct: d.dp
+  };
+}
+async function finnhubSearch(query, proxyUrl) {
+  const base = proxyUrl || PROXY_BASE;
+  const res = await fetch(`${base}/search?q=${encodeURIComponent(query)}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const d = await res.json();
+  if (d.error) throw new Error(d.error);
+  return (d.result || []).slice(0, 8);
+}
+async function finnhubMulti(symbols, proxyUrl) {
+  const base = proxyUrl || PROXY_BASE;
+  const res = await fetch(`${base}/multi?symbols=${encodeURIComponent(symbols.join(","))}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+// ─── BCE EXCHANGE RATE (via Frankfurter / ECB official rates) ────────
+const ecbCache = {};
+async function getECBRate(date, currency = "USD") {
+  if (currency === "EUR") return {
+    rate: 1,
+    date
+  };
+  const key = `${date}_${currency}`;
+  if (ecbCache[key]) return ecbCache[key];
+  try {
+    const res = await fetch(`https://api.frankfurter.dev/v1/${date}?symbols=${currency}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const d = await res.json();
+    const rate = d.rates?.[currency];
+    if (!rate) throw new Error("No rate");
+    const result = {
+      rate,
+      date: d.date
+    }; // date may differ if weekend/holiday
+    ecbCache[key] = result;
+    ecbCache[`${d.date}_${currency}`] = result;
+    return result;
+  } catch (e) {
+    console.warn(`ECB rate error for ${date}/${currency}:`, e.message);
+    return null;
+  }
+}
+async function getCurrentECBRate(currency = "USD") {
+  if (currency === "EUR") return {
+    rate: 1,
+    date: "hoy"
+  };
+  const key = `latest_${currency}`;
+  if (ecbCache[key] && Date.now() - ecbCache[key]._ts < 3600000) return ecbCache[key];
+  try {
+    const res = await fetch(`https://api.frankfurter.dev/v1/latest?symbols=${currency}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const d = await res.json();
+    const rate = d.rates?.[currency];
+    if (!rate) throw new Error("No rate");
+    const result = {
+      rate,
+      date: d.date,
+      _ts: Date.now()
+    };
+    ecbCache[key] = result;
+    return result;
+  } catch (e) {
+    console.warn("ECB latest rate error:", e.message);
+    return null;
+  }
+}
+
+// Convert foreign amount to EUR: amount_foreign / rate = EUR
+const toEur = (amount, rate) => rate ? amount / rate : amount;
+
+// ─── TICKER MAP (European tickers need exchange suffix) ──────────────
+const TICKER_MAP = {
+  SAN: "SAN.MC",
+  BBVA: "BBVA.MC",
+  ITX: "ITX.MC",
+  TEF: "TEF.MC",
+  IBE: "IBE.MC",
+  REP: "REP.MC",
+  AMS: "AMS.MC",
+  FER: "FER.MC",
+  ENG: "ENG.MC",
+  MAP: "MAP.MC",
+  CAIXABANK: "CABK.MC",
+  CABK: "CABK.MC",
+  ACCIONA: "ANA.MC",
+  ANA: "ANA.MC",
+  CELLNEX: "CLNX.MC",
+  CLNX: "CLNX.MC",
+  ACS: "ACS.MC",
+  GRF: "GRF.MC",
+  AENA: "AENA.MC",
+  LOG: "LOG.MC",
+  IAG: "IAG.MC",
+  PHM: "PHM.MC",
+  SAB: "SAB.MC"
+};
+function toFinnhubSymbol(ticker) {
+  const up = ticker.toUpperCase().trim();
+  if (TICKER_MAP[up]) return TICKER_MAP[up];
+  if (up.includes(".")) return up;
+  return up;
+}
+
+// ─── STORAGE ─────────────────────────────────────────────────────────
+const STORE_KEY = "brus_portfolio_v4";
+const NP = {
+  currentPrice: null,
+  dayChange: null,
+  dayChangePct: null,
+  dayHigh: null,
+  dayLow: null,
+  ecbRateNow: null
+};
+const loadState = () => {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return {
+    proxyUrl: "",
+    holdings: [{
+      id: uid(),
+      ticker: "AMZN",
+      finnhubSymbol: "AMZN",
+      name: "Amazon",
+      type: "accion",
+      shares: 15,
+      avgPrice: 183.42,
+      currency: "USD",
+      sector: "Tecnología",
+      buyDate: "2024-07-30",
+      ecbRateBuy: 1.1085,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "GOOGL",
+      finnhubSymbol: "GOOGL",
+      name: "Alphabet",
+      type: "accion",
+      shares: 9,
+      avgPrice: 157.87,
+      currency: "USD",
+      sector: "Tecnología",
+      buyDate: "2024-08-05",
+      ecbRateBuy: 1.0864,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "META",
+      finnhubSymbol: "META",
+      name: "Meta Platforms",
+      type: "accion",
+      shares: 4,
+      avgPrice: 555.30,
+      currency: "USD",
+      sector: "Tecnología",
+      buyDate: "2025-04-03",
+      ecbRateBuy: 1.1178,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "BN",
+      finnhubSymbol: "BN",
+      name: "Brookfield Corp",
+      type: "accion",
+      shares: 45,
+      avgPrice: 43.09,
+      currency: "USD",
+      sector: "Financiero",
+      buyDate: "2025-10-13",
+      ecbRateBuy: 1.1631,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "ORCL",
+      finnhubSymbol: "ORCL",
+      name: "Oracle Corp",
+      type: "accion",
+      shares: 20,
+      avgPrice: 181.55,
+      currency: "USD",
+      sector: "Tecnología",
+      buyDate: "2025-11-07",
+      ecbRateBuy: 1.1659,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "UBER",
+      finnhubSymbol: "UBER",
+      name: "Uber Technologies",
+      type: "accion",
+      shares: 29,
+      avgPrice: 75.01,
+      currency: "USD",
+      sector: "Tecnología",
+      buyDate: "2025-12-18",
+      ecbRateBuy: 1.1776,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "CASH",
+      finnhubSymbol: "CASH.MC",
+      name: "Prosegur Cash",
+      type: "accion",
+      shares: 800,
+      avgPrice: 0.63,
+      currency: "EUR",
+      sector: "Servicios",
+      buyDate: "2026-02-25",
+      ecbRateBuy: 1,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "NFLX",
+      finnhubSymbol: "NFLX",
+      name: "Netflix",
+      type: "accion",
+      shares: 28,
+      avgPrice: 84.24,
+      currency: "USD",
+      sector: "Tecnología",
+      buyDate: "2026-01-06",
+      ecbRateBuy: 1.1761,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "ADBE",
+      finnhubSymbol: "ADBE",
+      name: "Adobe Inc",
+      type: "accion",
+      shares: 4,
+      avgPrice: 292.36,
+      currency: "USD",
+      sector: "Tecnología",
+      buyDate: "2026-01-20",
+      ecbRateBuy: 1.1728,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "DMX",
+      finnhubSymbol: "DMX.V",
+      name: "DMX Technologies",
+      type: "accion",
+      shares: 700,
+      avgPrice: 0.69,
+      currency: "CAD",
+      sector: "Minería",
+      buyDate: "2026-01-27",
+      ecbRateBuy: 1.6186,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "MSFT",
+      finnhubSymbol: "MSFT",
+      name: "Microsoft",
+      type: "accion",
+      shares: 5,
+      avgPrice: 420.32,
+      currency: "USD",
+      sector: "Tecnología",
+      buyDate: "2026-01-29",
+      ecbRateBuy: 1.1903,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "KOS",
+      finnhubSymbol: "KOS",
+      name: "Kosmos Energy",
+      type: "accion",
+      shares: 450,
+      avgPrice: 1.88,
+      currency: "USD",
+      sector: "Energía",
+      buyDate: "2026-02-20",
+      ecbRateBuy: 1.1767,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "NVDA",
+      finnhubSymbol: "NVDA",
+      name: "NVIDIA Corp",
+      type: "accion",
+      shares: 5,
+      avgPrice: 181.00,
+      currency: "USD",
+      sector: "Tecnología",
+      buyDate: "2026-02-27",
+      ecbRateBuy: 1.1805,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "EQT",
+      finnhubSymbol: "EQT",
+      name: "EQT Corporation",
+      type: "accion",
+      shares: 30,
+      avgPrice: 61.33,
+      currency: "USD",
+      sector: "Energía",
+      buyDate: "2026-03-02",
+      ecbRateBuy: 1.1698,
+      ...NP
+    }, {
+      id: uid(),
+      ticker: "TEA",
+      finnhubSymbol: "TEA.AX",
+      name: "Tasman Resources",
+      type: "accion",
+      shares: 350,
+      avgPrice: 4.21,
+      currency: "AUD",
+      sector: "Consumo",
+      buyDate: "2026-03-05",
+      ecbRateBuy: 1.61,
+      ...NP
+    }],
+    sales: [{
+      id: uid(),
+      ticker: "IFX",
+      name: "Infineon",
+      currency: "EUR",
+      shares: 24,
+      buyPrice: 998.16,
+      sellPrice: 981.60,
+      buyDate: "2026-01-08",
+      sellDate: "2026-01-19",
+      ecbRateBuy: 1,
+      ecbRateSell: 1,
+      buyFees: 1.25,
+      sellFees: 1.25,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "MC",
+      name: "LVMH",
+      currency: "EUR",
+      shares: 4,
+      buyPrice: 2138.76,
+      sellPrice: 2143.20,
+      buyDate: "2024-09-06",
+      sellDate: "2026-02-03",
+      ecbRateBuy: 1,
+      ecbRateSell: 1,
+      buyFees: 5.00,
+      sellFees: 1.25,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "PLX",
+      name: "Pharma Lex",
+      currency: "EUR",
+      shares: 100,
+      buyPrice: 1174.00,
+      sellPrice: 1073.00,
+      buyDate: "2026-02-24",
+      sellDate: "2026-03-04",
+      ecbRateBuy: 1,
+      ecbRateSell: 1,
+      buyFees: 1.61,
+      sellFees: 1.25,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "FSLR",
+      name: "First Solar",
+      currency: "USD",
+      shares: 4,
+      buyPrice: 1120.00,
+      sellPrice: 937.88,
+      buyDate: "2025-12-22",
+      sellDate: "2026-01-12",
+      ecbRateBuy: 1.1745,
+      ecbRateSell: 1.1692,
+      buyFees: 0.30,
+      sellFees: 0.30,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "ASTS",
+      name: "AST SpaceMobile",
+      currency: "USD",
+      shares: 10,
+      buyPrice: 988.10,
+      sellPrice: 989.40,
+      buyDate: "2026-01-09",
+      sellDate: "2026-01-13",
+      ecbRateBuy: 1.1642,
+      ecbRateSell: 1.1654,
+      buyFees: 0.30,
+      sellFees: 0.30,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "ZETA",
+      name: "Zeta Global",
+      currency: "USD",
+      shares: 70,
+      buyPrice: 1565.20,
+      sellPrice: 1511.30,
+      buyDate: "2026-01-15",
+      sellDate: "2026-01-15",
+      ecbRateBuy: 1.1624,
+      ecbRateSell: 1.1624,
+      buyFees: 0.36,
+      sellFees: 0.33,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "BULL",
+      name: "Bull Horn",
+      currency: "USD",
+      shares: 70,
+      buyPrice: 639.80,
+      sellPrice: 528.50,
+      buyDate: "2025-11-26",
+      sellDate: "2026-01-27",
+      ecbRateBuy: 1.1577,
+      ecbRateSell: 1.1929,
+      buyFees: 0.31,
+      sellFees: 0.32,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "PYPL",
+      name: "PayPal",
+      currency: "USD",
+      shares: 20,
+      buyPrice: 1200.40,
+      sellPrice: 847.80,
+      buyDate: "2025-11-19",
+      sellDate: "2026-02-03",
+      ecbRateBuy: 1.1583,
+      ecbRateSell: 1.1801,
+      buyFees: 0.30,
+      sellFees: 0.31,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "FISV",
+      name: "Fiserv",
+      currency: "USD",
+      shares: 15,
+      buyPrice: 988.35,
+      sellPrice: 874.80,
+      buyDate: "2025-12-03",
+      sellDate: "2026-02-03",
+      ecbRateBuy: 1.1668,
+      ecbRateSell: 1.1801,
+      buyFees: 0.30,
+      sellFees: 0.31,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "TSLA",
+      name: "Tesla",
+      currency: "USD",
+      shares: 4,
+      buyPrice: 1674.28,
+      sellPrice: 1571.84,
+      buyDate: "2026-02-03",
+      sellDate: "2026-02-05",
+      ecbRateBuy: 1.1801,
+      ecbRateSell: 1.1798,
+      buyFees: 0.30,
+      sellFees: 0.30,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "PG",
+      name: "Procter & Gamble",
+      currency: "USD",
+      shares: 12,
+      buyPrice: 1886.28,
+      sellPrice: 1887.24,
+      buyDate: "2026-02-04",
+      sellDate: "2026-02-18",
+      ecbRateBuy: 1.182,
+      ecbRateSell: 1.1845,
+      buyFees: 0.30,
+      sellFees: 0.30,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "AG",
+      name: "First Majestic Silver",
+      currency: "USD",
+      shares: 80,
+      buyPrice: 748.00,
+      sellPrice: 2239.20,
+      buyDate: "2025-09-08",
+      sellDate: "2026-02-24",
+      ecbRateBuy: 1.1728,
+      ecbRateSell: 1.1777,
+      buyFees: 0.14,
+      sellFees: 0.20,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "NXT",
+      name: "Nexttracker",
+      currency: "USD",
+      shares: 14,
+      buyPrice: 1633.80,
+      sellPrice: 1544.62,
+      buyDate: "2026-02-04",
+      sellDate: "2026-02-26",
+      ecbRateBuy: 1.182,
+      ecbRateSell: 1.1814,
+      buyFees: 0.30,
+      sellFees: 0.30,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "FTNT",
+      name: "Fortinet",
+      currency: "USD",
+      shares: 10,
+      buyPrice: 716.00,
+      sellPrice: 783.10,
+      buyDate: "2025-08-07",
+      sellDate: "2026-02-26",
+      ecbRateBuy: 1.1643,
+      ecbRateSell: 1.1814,
+      buyFees: 0.30,
+      sellFees: 0.30,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "QTRX",
+      name: "Quanterix",
+      currency: "USD",
+      shares: 85,
+      buyPrice: 508.30,
+      sellPrice: 560.15,
+      buyDate: "2026-02-25",
+      sellDate: "2026-02-26",
+      ecbRateBuy: 1.1784,
+      ecbRateSell: 1.1814,
+      buyFees: 0.53,
+      sellFees: 0.32,
+      fees: 0
+    }, {
+      id: uid(),
+      ticker: "FINV",
+      name: "FinVolution",
+      currency: "USD",
+      shares: 280,
+      buyPrice: 1565.20,
+      sellPrice: 1470.00,
+      buyDate: "2026-02-09",
+      sellDate: "2026-03-03",
+      ecbRateBuy: 1.1886,
+      ecbRateSell: 1.1589,
+      buyFees: 0.87,
+      sellFees: 0.94,
+      fees: 0
+    }],
+    riskTrades: []
+  };
+};
+
+// ─── ICONS ───────────────────────────────────────────────────────────
+const Icon = ({
+  d,
+  size = 18,
+  ...p
+}) => /*#__PURE__*/React.createElement("svg", _extends({
+  width: size,
+  height: size,
+  viewBox: "0 0 24 24",
+  fill: "none",
+  stroke: "currentColor",
+  strokeWidth: "2",
+  strokeLinecap: "round",
+  strokeLinejoin: "round"
+}, p), /*#__PURE__*/React.createElement("path", {
+  d: d
+}));
+const ChartI = () => /*#__PURE__*/React.createElement(Icon, {
+  d: "M3 3v18h18M7 16l4-8 4 4 6-10"
+});
+const SaleI = () => /*#__PURE__*/React.createElement(Icon, {
+  d: "M12 1v22M5 8l7-7 7 7"
+});
+const RiskI = () => /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Icon, {
+  d: "M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"
+}), /*#__PURE__*/React.createElement("line", {
+  x1: "12",
+  y1: "9",
+  x2: "12",
+  y2: "13",
+  stroke: "currentColor",
+  strokeWidth: "2"
+}), /*#__PURE__*/React.createElement("line", {
+  x1: "12",
+  y1: "17",
+  x2: "12.01",
+  y2: "17",
+  stroke: "currentColor",
+  strokeWidth: "2"
+}));
+const PlusI = () => /*#__PURE__*/React.createElement(Icon, {
+  d: "M12 5v14M5 12h14",
+  size: 15
+});
+const TrashI = () => /*#__PURE__*/React.createElement(Icon, {
+  d: "M3 6h18M19 6l-1 14H6L5 6M10 11v6M14 11v6M9 6V4h6v2",
+  size: 14
+});
+const EditI = () => /*#__PURE__*/React.createElement(Icon, {
+  d: "M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z",
+  size: 14
+});
+const RefreshI = () => /*#__PURE__*/React.createElement(Icon, {
+  d: "M23 4v6h-6M20.49 15a9 9 0 11-2.12-9.36L23 10",
+  size: 14
+});
+const KeyI = () => /*#__PURE__*/React.createElement(Icon, {
+  d: "M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.78 7.78 5.5 5.5 0 017.78-7.78zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4",
+  size: 16
+});
+const SearchI = () => /*#__PURE__*/React.createElement(Icon, {
+  d: "M11 17.25a6.25 6.25 0 110-12.5 6.25 6.25 0 010 12.5zM16 16l4.5 4.5",
+  size: 15
+});
+const LiveDot = ({
+  active
+}) => /*#__PURE__*/React.createElement("span", {
+  style: {
+    display: "inline-block",
+    width: 8,
+    height: 8,
+    borderRadius: "50%",
+    background: active ? "#059669" : "#dc2626",
+    boxShadow: active ? "0 0 8px rgba(5,150,105,0.5)" : "none",
+    animation: active ? "pulse 2s infinite" : "none"
+  }
+});
+
+// ─── COLORS ──────────────────────────────────────────────────────────
+const C = {
+  bg: "#f5f6f8",
+  card: "#ffffff",
+  cardAlt: "#f0f1f4",
+  border: "#e2e5ea",
+  accent: "#059669",
+  accentDim: "rgba(5,150,105,0.08)",
+  red: "#dc2626",
+  redDim: "rgba(220,38,38,0.07)",
+  amber: "#b45309",
+  amberDim: "rgba(180,83,9,0.07)",
+  blue: "#2563eb",
+  blueDim: "rgba(37,99,235,0.07)",
+  purple: "#7c3aed",
+  text: "#1a1d23",
+  textDim: "#5f6672",
+  textMuted: "#9ca3af"
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════════════
+function App() {
+  const [state, setState] = useState(loadState);
+  const [tab, setTab] = useState("cartera");
+  const [modal, setModal] = useState(null);
+  const [lastUpdate, setLastUpdate] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [apiStatus, setApiStatus] = useState("idle"); // idle | ok | error
+  const intervalRef = useRef(null);
+
+  // Persist
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(state));
+    } catch {}
+  }, [state]);
+
+  // ─── FETCH ALL PRICES ───
+  const refreshPrices = useCallback(async () => {
+    if (!state.proxyUrl || state.holdings.length === 0) return;
+    setLoading(true);
+    let anySuccess = false;
+    const updated = [...state.holdings];
+
+    // Fetch current ECB rates for all foreign currencies in portfolio
+    const foreignCurrencies = [...new Set(updated.filter(h => h.currency !== "EUR").map(h => h.currency))];
+    const currentRates = {};
+    for (const curr of foreignCurrencies) {
+      const ecb = await getCurrentECBRate(curr);
+      if (ecb) currentRates[curr] = ecb.rate;
+    }
+
+    // Use /multi endpoint for batch fetch (faster, single request)
+    const symbols = updated.map(h => h.finnhubSymbol || toFinnhubSymbol(h.ticker));
+    try {
+      const batch = await finnhubMulti(symbols, state.proxyUrl);
+      for (let i = 0; i < updated.length; i++) {
+        const sym = symbols[i];
+        const d = batch[sym];
+        if (d && !d.error && d.c > 0) {
+          updated[i] = {
+            ...updated[i],
+            finnhubSymbol: sym,
+            currentPrice: d.c,
+            dayChange: d.d,
+            dayChangePct: d.dp,
+            dayHigh: d.h,
+            dayLow: d.l,
+            ecbRateNow: updated[i].currency !== "EUR" ? currentRates[updated[i].currency] || updated[i].ecbRateBuy : 1
+          };
+          anySuccess = true;
+        }
+      }
+    } catch (err) {
+      console.warn("Batch fetch error, falling back to individual:", err.message);
+      for (let i = 0; i < updated.length; i++) {
+        const h = updated[i];
+        const symbol = h.finnhubSymbol || toFinnhubSymbol(h.ticker);
+        try {
+          const q = await finnhubQuote(symbol, state.proxyUrl);
+          updated[i] = {
+            ...h,
+            finnhubSymbol: symbol,
+            currentPrice: q.current,
+            dayChange: q.change,
+            dayChangePct: q.changePct,
+            dayHigh: q.high,
+            dayLow: q.low,
+            ecbRateNow: h.currency !== "EUR" ? currentRates[h.currency] || h.ecbRateBuy : 1
+          };
+          anySuccess = true;
+        } catch (e) {
+          console.warn(`Error ${symbol}:`, e.message);
+        }
+        if (i < updated.length - 1) await new Promise(r => setTimeout(r, 300));
+      }
+    }
+    setState(prev => ({
+      ...prev,
+      holdings: prev.holdings.map(h => {
+        const match = updated.find(u => u.id === h.id);
+        return match ? {
+          ...h,
+          currentPrice: match.currentPrice,
+          dayChange: match.dayChange,
+          dayChangePct: match.dayChangePct,
+          dayHigh: match.dayHigh,
+          dayLow: match.dayLow,
+          finnhubSymbol: match.finnhubSymbol,
+          ecbRateNow: match.ecbRateNow
+        } : h;
+      })
+    }));
+    setApiStatus(anySuccess ? "ok" : "error");
+    setLastUpdate(new Date());
+    setLoading(false);
+  }, [state.proxyUrl, state.holdings.length]);
+
+  // Auto-refresh every 60s
+  useEffect(() => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    if (state.proxyUrl) {
+      refreshPrices();
+      intervalRef.current = setInterval(refreshPrices, 60000);
+    }
+    return () => clearInterval(intervalRef.current);
+  }, [state.proxyUrl]);
+
+  // ─── COMPUTED (all in EUR) ───
+  const holdingsWithPrice = state.holdings.filter(h => h.currentPrice != null);
+  const totalInvested = holdingsWithPrice.reduce((s, h) => {
+    const avgEur = h.currency !== "EUR" ? toEur(h.avgPrice, h.ecbRateBuy) : h.avgPrice;
+    return s + h.shares * avgEur;
+  }, 0);
+  const totalCurrent = holdingsWithPrice.reduce((s, h) => {
+    const curEur = h.currency !== "EUR" ? toEur(h.currentPrice, h.ecbRateNow || h.ecbRateBuy) : h.currentPrice;
+    return s + h.shares * curEur;
+  }, 0);
+  const totalPL = totalCurrent - totalInvested;
+  const totalPLPct = totalInvested > 0 ? pctChange(totalCurrent, totalInvested) : 0;
+  const realizedPL = state.sales.reduce((s, sale) => {
+    const buyEur = sale.currency !== "EUR" ? toEur(sale.buyPrice, sale.ecbRateBuy) : sale.buyPrice;
+    const sellEur = sale.currency !== "EUR" ? toEur(sale.sellPrice, sale.ecbRateSell) : sale.sellPrice;
+    const buyFees = sale.buyFees || 0;
+    const sellFees = sale.sellFees || sale.fees || 0;
+    return s + (sellEur - sellFees) - (buyEur + buyFees);
+  }, 0);
+
+  // ─── HANDLERS ───
+  const setProxyUrl = url => setState(p => ({
+    ...p,
+    proxyUrl: url
+  }));
+  const addHolding = h => setState(p => ({
+    ...p,
+    holdings: [...p.holdings, {
+      ...h,
+      id: uid()
+    }]
+  }));
+  const removeHolding = id => setState(p => ({
+    ...p,
+    holdings: p.holdings.filter(h => h.id !== id)
+  }));
+  const addSale = s => setState(p => ({
+    ...p,
+    sales: [...p.sales, {
+      ...s,
+      id: uid()
+    }]
+  }));
+  const removeSale = id => setState(p => ({
+    ...p,
+    sales: p.sales.filter(s => s.id !== id)
+  }));
+  const updateSale = (id, data) => setState(p => ({
+    ...p,
+    sales: p.sales.map(s => s.id === id ? {
+      ...s,
+      ...data
+    } : s)
+  }));
+  const addRiskTrade = r => setState(p => ({
+    ...p,
+    riskTrades: [...p.riskTrades, {
+      ...r,
+      id: uid()
+    }]
+  }));
+  const removeRiskTrade = id => setState(p => ({
+    ...p,
+    riskTrades: p.riskTrades.filter(r => r.id !== id)
+  }));
+
+  // Modal uses string keys for forms that need fresh state access
+  const openAddHolding = () => setModal("addHolding");
+  const openAddSale = () => setModal("addSale");
+  const openEditSale = sale => setModal({
+    type: "editSale",
+    sale
+  });
+  const cs = {
+    background: C.card,
+    border: `1px solid ${C.border}`,
+    borderRadius: 10,
+    padding: 18,
+    boxShadow: "0 1px 3px rgba(0,0,0,0.06)"
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      minHeight: "100vh",
+      background: C.bg,
+      color: C.text,
+      fontFamily: "'DM Sans','Segoe UI','Helvetica Neue',sans-serif",
+      fontSize: 13
+    }
+  }, /*#__PURE__*/React.createElement("link", {
+    href: "https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap",
+    rel: "stylesheet"
+  }), /*#__PURE__*/React.createElement("style", null, `
+        @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.4} }
+        @keyframes fadeIn { from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)} }
+        .row:hover { background: ${C.cardAlt} !important; }
+        input:focus, select:focus { border-color: ${C.accent} !important; outline: none; box-shadow: 0 0 0 3px ${C.accentDim}; }
+        ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-thumb { background: ${C.border}; border-radius: 3px; }
+      `), /*#__PURE__*/React.createElement("header", {
+    style: {
+      background: `linear-gradient(180deg, #ffffff 0%, ${C.bg} 100%)`,
+      borderBottom: `1px solid ${C.border}`,
+      padding: "14px 20px",
+      position: "sticky",
+      top: 0,
+      zIndex: 100
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxWidth: 1100,
+      margin: "0 auto"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      flexWrap: "wrap",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 34,
+      height: 34,
+      borderRadius: 8,
+      background: `linear-gradient(135deg, ${C.accent}, #059669)`,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontFamily: "'DM Sans',sans-serif",
+      fontWeight: 800,
+      fontSize: 16,
+      color: "#fff"
+    }
+  }, "B"), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'DM Sans',sans-serif",
+      fontWeight: 700,
+      fontSize: 17,
+      letterSpacing: "-0.5px"
+    }
+  }, "Mi Cartera"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: C.textDim,
+      display: "flex",
+      alignItems: "center",
+      gap: 5
+    }
+  }, /*#__PURE__*/React.createElement(LiveDot, {
+    active: apiStatus === "ok"
+  }), apiStatus === "ok" ? "LIVE · Finnhub" : apiStatus === "error" ? "Error API" : "Sin conexión", lastUpdate && /*#__PURE__*/React.createElement("span", {
+    style: {
+      marginLeft: 4
+    }
+  }, "\xB7 ", lastUpdate.toLocaleTimeString("es-ES"))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 6
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setModal("apikey"),
+    style: {
+      background: state.proxyUrl ? C.accentDim : C.amberDim,
+      border: `1px solid ${state.proxyUrl ? C.accent : C.amber}33`,
+      borderRadius: 6,
+      padding: "5px 10px",
+      color: state.proxyUrl ? C.accent : C.amber,
+      cursor: "pointer",
+      fontSize: 10,
+      display: "flex",
+      alignItems: "center",
+      gap: 4,
+      fontFamily: "inherit"
+    }
+  }, /*#__PURE__*/React.createElement(KeyI, null), " ", state.proxyUrl ? "Proxy ✓" : "Configurar Proxy"), /*#__PURE__*/React.createElement("button", {
+    onClick: refreshPrices,
+    disabled: loading || !state.proxyUrl,
+    style: {
+      background: C.accentDim,
+      border: `1px solid ${C.accent}33`,
+      borderRadius: 6,
+      padding: "5px 10px",
+      color: C.accent,
+      cursor: state.proxyUrl ? "pointer" : "not-allowed",
+      fontSize: 10,
+      display: "flex",
+      alignItems: "center",
+      gap: 4,
+      fontFamily: "inherit",
+      opacity: loading ? 0.5 : 1
+    }
+  }, /*#__PURE__*/React.createElement(RefreshI, null), " ", loading ? "Cargando..." : "Actualizar"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
+      gap: 10,
+      marginTop: 12
+    }
+  }, [{
+    label: "Valor Cartera",
+    val: fmtEur(totalCurrent),
+    c: C.text
+  }, {
+    label: "Invertido",
+    val: fmtEur(totalInvested),
+    c: C.blue
+  }, {
+    label: "P/L No Realizado",
+    val: `${fmtEur(totalPL)} (${fmtPct(totalPLPct)})`,
+    c: totalPL >= 0 ? C.accent : C.red
+  }, {
+    label: "P/L Realizado",
+    val: fmtEur(realizedPL),
+    c: realizedPL >= 0 ? C.accent : C.red
+  }].map((x, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      padding: "8px 12px",
+      borderRadius: 8,
+      background: `${x.c}06`,
+      border: `1px solid ${x.c}15`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: C.textDim,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      marginBottom: 2
+    }
+  }, x.label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      fontWeight: 600,
+      color: x.c
+    }
+  }, x.val)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 3,
+      marginTop: 12
+    }
+  }, [{
+    key: "cartera",
+    label: "Cartera",
+    icon: /*#__PURE__*/React.createElement(ChartI, null)
+  }, {
+    key: "ventas",
+    label: "Ventas / IRPF",
+    icon: /*#__PURE__*/React.createElement(SaleI, null)
+  }, {
+    key: "riesgo",
+    label: "Gestión Riesgo",
+    icon: /*#__PURE__*/React.createElement(RiskI, null)
+  }].map(t => /*#__PURE__*/React.createElement("button", {
+    key: t.key,
+    onClick: () => setTab(t.key),
+    style: {
+      flex: 1,
+      padding: "9px 10px",
+      borderRadius: 8,
+      border: tab === t.key ? `1px solid ${C.accent}44` : "1px solid transparent",
+      background: tab === t.key ? C.accentDim : "transparent",
+      color: tab === t.key ? C.accent : C.textDim,
+      cursor: "pointer",
+      fontSize: 11,
+      fontWeight: 500,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: 5,
+      fontFamily: "inherit",
+      transition: "all 0.15s"
+    }
+  }, t.icon, " ", t.label))))), /*#__PURE__*/React.createElement("main", {
+    style: {
+      maxWidth: 1100,
+      margin: "0 auto",
+      padding: 18
+    }
+  }, !state.proxyUrl && /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...cs,
+      marginBottom: 16,
+      background: `${C.amber}08`,
+      border: `1px solid ${C.amber}25`,
+      textAlign: "center",
+      animation: "fadeIn 0.3s"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 14,
+      fontWeight: 600,
+      color: C.amber,
+      marginBottom: 6
+    }
+  }, "Configura tu Proxy de precios"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.textDim,
+      marginBottom: 12
+    }
+  }, "Despliega el Cloudflare Worker y pega aqu\xED la URL. \u2192 60 peticiones/minuto, precios en tiempo real de US + Europa."), /*#__PURE__*/React.createElement(Btn, {
+    onClick: () => setModal("apikey"),
+    style: {
+      background: C.amber,
+      color: "#fff"
+    }
+  }, /*#__PURE__*/React.createElement(KeyI, null), " Configurar proxy")), tab === "cartera" && /*#__PURE__*/React.createElement(CarteraTab, {
+    holdings: state.holdings,
+    removeHolding: removeHolding,
+    openAddHolding: openAddHolding,
+    cs: cs
+  }), tab === "ventas" && /*#__PURE__*/React.createElement(VentasTab, {
+    sales: state.sales,
+    removeSale: removeSale,
+    openAddSale: openAddSale,
+    openEditSale: openEditSale,
+    cs: cs
+  }), tab === "riesgo" && /*#__PURE__*/React.createElement(RiesgoTab, {
+    riskTrades: state.riskTrades,
+    addRiskTrade: addRiskTrade,
+    removeRiskTrade: removeRiskTrade,
+    setModal: setModal,
+    cs: cs
+  })), modal && /*#__PURE__*/React.createElement("div", {
+    onClick: () => setModal(null),
+    style: {
+      position: "fixed",
+      inset: 0,
+      background: "rgba(0,0,0,0.35)",
+      backdropFilter: "blur(6px)",
+      zIndex: 200,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      padding: 20
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    onClick: e => e.stopPropagation(),
+    style: {
+      ...cs,
+      maxWidth: 480,
+      width: "100%",
+      maxHeight: "85vh",
+      overflowY: "auto",
+      animation: "fadeIn 0.2s"
+    }
+  }, modal === "apikey" ? /*#__PURE__*/React.createElement(ApiKeyModal, {
+    proxyUrl: state.proxyUrl,
+    setProxyUrl: setProxyUrl,
+    close: () => setModal(null)
+  }) : modal === "addHolding" ? /*#__PURE__*/React.createElement(HoldingForm, {
+    addHolding: addHolding,
+    proxyUrl: state.proxyUrl,
+    setModal: setModal,
+    refreshPrices: refreshPrices
+  }) : modal === "addSale" ? /*#__PURE__*/React.createElement(SaleForm, {
+    addSale: addSale,
+    proxyUrl: state.proxyUrl,
+    setModal: setModal
+  }) : modal && modal.type === "editSale" ? /*#__PURE__*/React.createElement(EditSaleForm, {
+    sale: modal.sale,
+    updateSale: updateSale,
+    proxyUrl: state.proxyUrl,
+    setModal: setModal
+  }) : modal)));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SHARED COMPONENTS
+// ═══════════════════════════════════════════════════════════════════════
+const Input = ({
+  label,
+  ...p
+}) => /*#__PURE__*/React.createElement("div", {
+  style: {
+    marginBottom: 10
+  }
+}, label && /*#__PURE__*/React.createElement("label", {
+  style: {
+    fontSize: 9,
+    color: C.textDim,
+    textTransform: "uppercase",
+    letterSpacing: 1,
+    display: "block",
+    marginBottom: 3
+  }
+}, label), /*#__PURE__*/React.createElement("input", _extends({}, p, {
+  style: {
+    width: "100%",
+    padding: "7px 10px",
+    borderRadius: 6,
+    border: `1px solid ${C.border}`,
+    background: "#fff",
+    color: C.text,
+    fontSize: 12,
+    fontFamily: "inherit",
+    boxSizing: "border-box",
+    ...((p || {}).style || {})
+  }
+})));
+const Select = ({
+  label,
+  children,
+  ...p
+}) => /*#__PURE__*/React.createElement("div", {
+  style: {
+    marginBottom: 10
+  }
+}, label && /*#__PURE__*/React.createElement("label", {
+  style: {
+    fontSize: 9,
+    color: C.textDim,
+    textTransform: "uppercase",
+    letterSpacing: 1,
+    display: "block",
+    marginBottom: 3
+  }
+}, label), /*#__PURE__*/React.createElement("select", _extends({}, p, {
+  style: {
+    width: "100%",
+    padding: "7px 10px",
+    borderRadius: 6,
+    border: `1px solid ${C.border}`,
+    background: "#fff",
+    color: C.text,
+    fontSize: 12,
+    fontFamily: "inherit"
+  }
+}), children));
+const Btn = ({
+  children,
+  variant = "primary",
+  ...p
+}) => {
+  const s = {
+    primary: {
+      background: C.accent,
+      color: "#fff",
+      border: "none"
+    },
+    danger: {
+      background: C.redDim,
+      color: C.red,
+      border: `1px solid ${C.red}33`
+    },
+    ghost: {
+      background: "transparent",
+      color: C.textDim,
+      border: `1px solid ${C.border}`
+    }
+  };
+  return /*#__PURE__*/React.createElement("button", _extends({}, p, {
+    style: {
+      padding: "7px 14px",
+      borderRadius: 6,
+      fontSize: 11,
+      fontWeight: 600,
+      cursor: "pointer",
+      fontFamily: "inherit",
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 4,
+      transition: "all 0.15s",
+      ...s[variant],
+      ...(p.style || {})
+    }
+  }), children);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// PROXY CONFIG MODAL
+// ═══════════════════════════════════════════════════════════════════════
+function ApiKeyModal({
+  proxyUrl,
+  setProxyUrl,
+  close
+}) {
+  const [url, setUrl] = useState(proxyUrl || "");
+  const [testing, setTesting] = useState(false);
+  const [result, setResult] = useState(null);
+  const test = async () => {
+    setTesting(true);
+    setResult(null);
+    try {
+      let testUrl = url.trim().replace(/\/+$/, "");
+      const q = await finnhubQuote("AAPL", testUrl);
+      setResult({
+        ok: true,
+        msg: `Apple: $${q.current} — Proxy funcionando correctamente`
+      });
+    } catch (e) {
+      setResult({
+        ok: false,
+        msg: `Error: ${e.message}. Verifica la URL del worker.`
+      });
+    }
+    setTesting(false);
+  };
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontFamily: "'DM Sans',sans-serif",
+      fontSize: 15,
+      marginBottom: 4,
+      color: C.accent
+    }
+  }, "Configurar Proxy de Precios"), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 11,
+      color: C.textDim,
+      marginBottom: 14,
+      lineHeight: 1.6
+    }
+  }, "Introduce la URL de tu Cloudflare Worker que hace de proxy a Finnhub. Despliega el worker con tu API key de ", /*#__PURE__*/React.createElement("a", {
+    href: "https://finnhub.io",
+    target: "_blank",
+    rel: "noreferrer",
+    style: {
+      color: C.blue
+    }
+  }, "finnhub.io"), " y pega aqu\xED la URL resultante."), /*#__PURE__*/React.createElement(Input, {
+    label: "URL del Worker",
+    value: url,
+    onChange: e => setUrl(e.target.value),
+    placeholder: "https://finnhub-proxy.tu-usuario.workers.dev"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: C.textDim,
+      marginTop: -6,
+      marginBottom: 10,
+      lineHeight: 1.5
+    }
+  }, "Endpoints disponibles: ", /*#__PURE__*/React.createElement("code", {
+    style: {
+      background: C.cardAlt,
+      padding: "1px 4px",
+      borderRadius: 3
+    }
+  }, "/quote"), " ", /*#__PURE__*/React.createElement("code", {
+    style: {
+      background: C.cardAlt,
+      padding: "1px 4px",
+      borderRadius: 3
+    }
+  }, "/search"), " ", /*#__PURE__*/React.createElement("code", {
+    style: {
+      background: C.cardAlt,
+      padding: "1px 4px",
+      borderRadius: 3
+    }
+  }, "/multi")), result && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "8px 12px",
+      borderRadius: 6,
+      marginBottom: 10,
+      fontSize: 11,
+      background: result.ok ? C.accentDim : C.redDim,
+      color: result.ok ? C.accent : C.red,
+      border: `1px solid ${result.ok ? C.accent : C.red}33`
+    }
+  }, result.msg), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    onClick: test,
+    disabled: !url || testing,
+    variant: "ghost"
+  }, testing ? "Probando..." : "Probar conexión"), /*#__PURE__*/React.createElement(Btn, {
+    onClick: () => {
+      setProxyUrl(url.trim().replace(/\/+$/, ""));
+      close();
+    }
+  }, "Guardar"), /*#__PURE__*/React.createElement(Btn, {
+    variant: "ghost",
+    onClick: close
+  }, "Cancelar")));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CARTERA TAB
+// ═══════════════════════════════════════════════════════════════════════
+// ─── SECTOR MAP (used by HoldingForm) ───
+const SECTOR_MAP = {
+  // Financiero
+  SAN: "Financiero",
+  BBVA: "Financiero",
+  CABK: "Financiero",
+  SAB: "Financiero",
+  MAP: "Financiero",
+  "SAN.MC": "Financiero",
+  "BBVA.MC": "Financiero",
+  "CABK.MC": "Financiero",
+  "SAB.MC": "Financiero",
+  "MAP.MC": "Financiero",
+  JPM: "Financiero",
+  GS: "Financiero",
+  MS: "Financiero",
+  BAC: "Financiero",
+  C: "Financiero",
+  WFC: "Financiero",
+  // Tecnología
+  AAPL: "Tecnología",
+  MSFT: "Tecnología",
+  GOOGL: "Tecnología",
+  GOOG: "Tecnología",
+  AMZN: "Tecnología",
+  META: "Tecnología",
+  NVDA: "Tecnología",
+  TSM: "Tecnología",
+  AVGO: "Tecnología",
+  ORCL: "Tecnología",
+  CRM: "Tecnología",
+  AMD: "Tecnología",
+  INTC: "Tecnología",
+  QCOM: "Tecnología",
+  ADBE: "Tecnología",
+  NFLX: "Tecnología",
+  UBER: "Tecnología",
+  SHOP: "Tecnología",
+  PLTR: "Tecnología",
+  SNOW: "Tecnología",
+  // Consumo
+  ITX: "Consumo",
+  "ITX.MC": "Consumo",
+  KO: "Consumo",
+  PEP: "Consumo",
+  MCD: "Consumo",
+  NKE: "Consumo",
+  SBUX: "Consumo",
+  PG: "Consumo",
+  UL: "Consumo",
+  COST: "Consumo",
+  WMT: "Consumo",
+  // Energía
+  REP: "Energía",
+  "REP.MC": "Energía",
+  IBE: "Energía",
+  "IBE.MC": "Energía",
+  ENG: "Energía",
+  "ENG.MC": "Energía",
+  ANA: "Energía",
+  "ANA.MC": "Energía",
+  XOM: "Energía",
+  CVX: "Energía",
+  COP: "Energía",
+  SLB: "Energía",
+  // Telecomunicaciones
+  TEF: "Telecomunicaciones",
+  "TEF.MC": "Telecomunicaciones",
+  T: "Telecomunicaciones",
+  VZ: "Telecomunicaciones",
+  TMUS: "Telecomunicaciones",
+  // Infraestructuras
+  ACS: "Infraestructuras",
+  "ACS.MC": "Infraestructuras",
+  FER: "Infraestructuras",
+  "FER.MC": "Infraestructuras",
+  AENA: "Infraestructuras",
+  "AENA.MC": "Infraestructuras",
+  CLNX: "Infraestructuras",
+  "CLNX.MC": "Infraestructuras",
+  // Farmacéutico / Salud
+  GRF: "Salud",
+  "GRF.MC": "Salud",
+  JNJ: "Salud",
+  PFE: "Salud",
+  UNH: "Salud",
+  LLY: "Salud",
+  ABBV: "Salud",
+  MRK: "Salud",
+  NVO: "Salud",
+  AZN: "Salud",
+  // Transporte / Aerolíneas
+  IAG: "Transporte",
+  "IAG.MC": "Transporte",
+  DAL: "Transporte",
+  UAL: "Transporte",
+  // Inmobiliario
+  LOG: "Inmobiliario",
+  "LOG.MC": "Inmobiliario",
+  // Industrial
+  CAT: "Industrial",
+  BA: "Industrial",
+  HON: "Industrial",
+  GE: "Industrial",
+  DE: "Industrial",
+  // Materias primas
+  AMS: "Materias Primas",
+  "AMS.MC": "Materias Primas",
+  BHP: "Materias Primas",
+  RIO: "Materias Primas"
+};
+const detectSector = (symbol, name) => {
+  const sym = (symbol || "").toUpperCase();
+  if (SECTOR_MAP[sym]) return SECTOR_MAP[sym];
+  // Try without exchange suffix
+  const base = sym.split(".")[0];
+  if (SECTOR_MAP[base]) return SECTOR_MAP[base];
+  // Keyword detection from name
+  const n = (name || "").toLowerCase();
+  if (n.match(/bank|financ|capital|credit|insur/)) return "Financiero";
+  if (n.match(/tech|software|semiconductor|chip|digital|cloud|cyber|data/)) return "Tecnología";
+  if (n.match(/pharm|health|medic|biotech|therap/)) return "Salud";
+  if (n.match(/energy|oil|gas|petrol|solar|wind|renew|electr|power|utilit/)) return "Energía";
+  if (n.match(/consumer|retail|food|beverage|cloth|fashion|luxury/)) return "Consumo";
+  if (n.match(/telecom|commun|mobile|wireless/)) return "Telecomunicaciones";
+  if (n.match(/construct|infrastr|engineer|airport|tower/)) return "Infraestructuras";
+  if (n.match(/real estate|reit|property|inmobil/)) return "Inmobiliario";
+  if (n.match(/industr|manufact|machin|aero|defen/)) return "Industrial";
+  if (n.match(/mining|metal|steel|material|chemical/)) return "Materias Primas";
+  if (n.match(/etf|index|fund|vanguard|ishares|amundi|lyxor|spdr/)) return "Fondo Indexado";
+  return "Otros";
+};
+function HoldingForm({
+  addHolding,
+  proxyUrl,
+  setModal,
+  refreshPrices
+}) {
+  const [form, setForm] = useState({
+    ticker: "",
+    name: "",
+    type: "accion",
+    sector: "",
+    finnhubSymbol: "",
+    currency: "EUR"
+  });
+  const [lots, setLots] = useState([]);
+  const [lotForm, setLotForm] = useState({
+    shares: "",
+    price: "",
+    date: ""
+  });
+  const [results, setResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [ecbRates, setEcbRates] = useState({});
+  const debounceRef = useRef(null);
+
+  // Auto-fetch ECB rate when lot date changes + USD
+  useEffect(() => {
+    if (form.currency !== "EUR" && lotForm.date) {
+      getECBRate(lotForm.date, form.currency).then(r => {
+        if (r) setEcbRates(prev => ({
+          ...prev,
+          [lotForm.date]: r
+        }));
+      });
+    }
+  }, [form.currency, lotForm.date]);
+  const search = q => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (!q || !proxyUrl) {
+      setResults([]);
+      return;
+    }
+    debounceRef.current = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const r = await finnhubSearch(q, proxyUrl);
+        setResults(r);
+      } catch {
+        setResults([]);
+      }
+      setSearching(false);
+    }, 400);
+  };
+  const selectResult = r => {
+    const isUS = !r.symbol.includes(".");
+    const autoSector = detectSector(r.symbol, r.description);
+    setForm(f => ({
+      ...f,
+      ticker: r.displaySymbol || r.symbol,
+      finnhubSymbol: r.symbol,
+      name: r.description || r.symbol,
+      currency: isUS ? "USD" : "EUR",
+      sector: autoSector
+    }));
+    setResults([]);
+  };
+
+  // Add a lot to the list
+  const addLot = () => {
+    if (!lotForm.shares || !lotForm.price) return;
+    if (form.currency !== "EUR" && !lotForm.date) return;
+    const rate = form.currency !== "EUR" && lotForm.date ? ecbRates[lotForm.date] : null;
+    if (form.currency !== "EUR" && !rate) return;
+    setLots(prev => [...prev, {
+      id: uid(),
+      shares: parseFloat(lotForm.shares),
+      price: parseFloat(lotForm.price),
+      date: lotForm.date,
+      ecbRate: rate ? rate.rate : 1,
+      ecbDate: rate ? rate.date : null
+    }]);
+    setLotForm({
+      shares: "",
+      price: "",
+      date: lotForm.date
+    }); // Keep date for convenience
+  };
+  const removeLot = id => setLots(prev => prev.filter(l => l.id !== id));
+
+  // Compute weighted average
+  const totalShares = lots.reduce((s, l) => s + l.shares, 0);
+  const totalCost = lots.reduce((s, l) => s + l.shares * l.price, 0);
+  const avgPrice = totalShares > 0 ? totalCost / totalShares : 0;
+  // For USD: weighted average ECB rate
+  const avgEcbRate = totalShares > 0 ? lots.reduce((s, l) => s + l.shares * l.ecbRate, 0) / totalShares : 1;
+  const avgPriceEur = form.currency !== "EUR" ? toEur(avgPrice, avgEcbRate) : avgPrice;
+
+  // Final submit: consolidate all lots into one holding
+  const submitAll = () => {
+    if (!form.ticker) return;
+    // Auto-add current lot if fields are filled but not yet added
+    let finalLots = [...lots];
+    if (lotForm.shares && lotForm.price) {
+      const rate = form.currency !== "EUR" && lotForm.date ? ecbRates[lotForm.date] : null;
+      if (form.currency === "EUR" || rate) {
+        finalLots.push({
+          id: uid(),
+          shares: parseFloat(lotForm.shares),
+          price: parseFloat(lotForm.price),
+          date: lotForm.date,
+          ecbRate: rate ? rate.rate : 1
+        });
+      }
+    }
+    if (finalLots.length === 0) return;
+    const fTotalShares = finalLots.reduce((s, l) => s + l.shares, 0);
+    const fTotalCost = finalLots.reduce((s, l) => s + l.shares * l.price, 0);
+    const fAvgPrice = fTotalShares > 0 ? fTotalCost / fTotalShares : 0;
+    const fAvgRate = fTotalShares > 0 ? finalLots.reduce((s, l) => s + l.shares * l.ecbRate, 0) / fTotalShares : 1;
+    addHolding({
+      ...form,
+      finnhubSymbol: form.finnhubSymbol || toFinnhubSymbol(form.ticker),
+      shares: fTotalShares,
+      avgPrice: fAvgPrice,
+      buyDate: finalLots[0].date || "",
+      ecbRateBuy: fAvgRate,
+      ecbRateNow: null,
+      currentPrice: null,
+      dayChange: null,
+      dayChangePct: null,
+      dayHigh: null,
+      dayLow: null
+    });
+    setModal(null);
+    setTimeout(refreshPrices, 500);
+  };
+  const currSym = form.currency === "EUR" ? "€" : "$";
+  const currentRate = form.currency !== "EUR" && lotForm.date ? ecbRates[lotForm.date] : null;
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontFamily: "'DM Sans',sans-serif",
+      fontSize: 15,
+      marginBottom: 14,
+      color: C.accent
+    }
+  }, "A\xF1adir Posici\xF3n"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "relative"
+    }
+  }, /*#__PURE__*/React.createElement(Input, {
+    label: "Buscar Ticker",
+    value: form.ticker,
+    placeholder: "Busca: AAPL, SAN, BBVA...",
+    onChange: e => {
+      setForm(f => ({
+        ...f,
+        ticker: e.target.value.toUpperCase()
+      }));
+      search(e.target.value);
+    }
+  }), searching && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: C.textDim,
+      marginTop: -8,
+      marginBottom: 8
+    }
+  }, "Buscando..."), results.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      top: "100%",
+      left: 0,
+      right: 0,
+      zIndex: 10,
+      background: C.card,
+      border: `1px solid ${C.border}`,
+      borderRadius: 6,
+      maxHeight: 200,
+      overflowY: "auto",
+      marginTop: -6
+    }
+  }, results.map((r, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    onClick: () => selectResult(r),
+    style: {
+      padding: "8px 10px",
+      cursor: "pointer",
+      borderBottom: `1px solid ${C.border}`,
+      fontSize: 11,
+      display: "flex",
+      justifyContent: "space-between"
+    },
+    className: "row"
+  }, /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: C.accent
+    }
+  }, r.displaySymbol || r.symbol), " \u2014 ", r.description), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.textMuted,
+      fontSize: 9
+    }
+  }, r.type))))), /*#__PURE__*/React.createElement(Input, {
+    label: "Nombre",
+    value: form.name,
+    onChange: e => setForm(f => ({
+      ...f,
+      name: e.target.value
+    })),
+    placeholder: "Banco Santander"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr 1fr",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement(Select, {
+    label: "Tipo",
+    value: form.type,
+    onChange: e => setForm(f => ({
+      ...f,
+      type: e.target.value
+    }))
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "accion"
+  }, "Acci\xF3n"), /*#__PURE__*/React.createElement("option", {
+    value: "fondo"
+  }, "Fondo / ETF")), /*#__PURE__*/React.createElement(Select, {
+    label: "Divisa",
+    value: form.currency,
+    onChange: e => setForm(f => ({
+      ...f,
+      currency: e.target.value
+    }))
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "EUR"
+  }, "EUR \u20AC"), /*#__PURE__*/React.createElement("option", {
+    value: "USD"
+  }, "USD $"), /*#__PURE__*/React.createElement("option", {
+    value: "GBP"
+  }, "GBP \xA3"), /*#__PURE__*/React.createElement("option", {
+    value: "CAD"
+  }, "CAD C$"), /*#__PURE__*/React.createElement("option", {
+    value: "AUD"
+  }, "AUD A$")), /*#__PURE__*/React.createElement(Input, {
+    label: "Sector",
+    value: form.sector,
+    onChange: e => setForm(f => ({
+      ...f,
+      sector: e.target.value
+    })),
+    placeholder: "Auto-detectado"
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "10px 12px",
+      borderRadius: 8,
+      background: C.accentDim,
+      border: `1px solid ${C.accent}20`,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: C.accent,
+      fontWeight: 600,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      marginBottom: 8
+    }
+  }, "A\xF1adir lote de compra"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr 1fr",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement(Input, {
+    label: "Acciones",
+    type: "number",
+    value: lotForm.shares,
+    onChange: e => setLotForm(f => ({
+      ...f,
+      shares: e.target.value
+    }))
+  }), /*#__PURE__*/React.createElement(Input, {
+    label: `Precio (${currSym})`,
+    type: "number",
+    step: "0.01",
+    value: lotForm.price,
+    onChange: e => setLotForm(f => ({
+      ...f,
+      price: e.target.value
+    }))
+  }), /*#__PURE__*/React.createElement(Input, {
+    label: "Fecha compra",
+    type: "date",
+    value: lotForm.date,
+    onChange: e => setLotForm(f => ({
+      ...f,
+      date: e.target.value
+    }))
+  })), form.currency !== "EUR" && lotForm.date && currentRate && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: C.blue,
+      marginBottom: 6
+    }
+  }, "BCE (", currentRate.date, "): 1 EUR = ", fmt(currentRate.rate, 4), " ", form.currency, lotForm.price && /*#__PURE__*/React.createElement("span", null, " \u2192 ", lotForm.price, currSym, " = ", fmtEur(toEur(parseFloat(lotForm.price), currentRate.rate)))), /*#__PURE__*/React.createElement(Btn, {
+    onClick: addLot,
+    disabled: !lotForm.shares || !lotForm.price || form.currency !== "EUR" && !currentRate,
+    style: {
+      fontSize: 10,
+      padding: "5px 10px"
+    }
+  }, /*#__PURE__*/React.createElement(PlusI, null), " A\xF1adir lote")), lots.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: C.textDim,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      marginBottom: 4
+    }
+  }, "Lotes (", lots.length, ") \u2014 Total: ", totalShares, " acciones"), lots.map((l, i) => {
+    const priceEur = form.currency !== "EUR" ? toEur(l.price, l.ecbRate) : l.price;
+    return /*#__PURE__*/React.createElement("div", {
+      key: l.id,
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        padding: "6px 10px",
+        borderRadius: 6,
+        marginBottom: 3,
+        background: i % 2 === 0 ? C.cardAlt : "transparent",
+        fontSize: 11
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontWeight: 500
+      }
+    }, l.shares, " \xD7 ", currSym, fmt(l.price)), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.textDim,
+        fontSize: 10
+      }
+    }, l.date), form.currency !== "EUR" && /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.blue,
+        fontSize: 10
+      }
+    }, "\u20AC", fmt(priceEur), " (BCE: ", fmt(l.ecbRate, 4), ")"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.textDim,
+        fontSize: 10
+      }
+    }, fmtEur(l.shares * priceEur)), /*#__PURE__*/React.createElement("button", {
+      onClick: () => removeLot(l.id),
+      style: {
+        background: "none",
+        border: "none",
+        color: C.textMuted,
+        cursor: "pointer",
+        padding: 2
+      }
+    }, /*#__PURE__*/React.createElement(TrashI, null)));
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "8px 12px",
+      borderRadius: 6,
+      marginTop: 6,
+      background: C.blueDim,
+      border: `1px solid ${C.blue}20`,
+      fontSize: 11
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.textDim
+    }
+  }, "Precio medio ponderado:"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontWeight: 600
+    }
+  }, currSym, fmt(avgPrice), form.currency !== "EUR" ? ` → ${fmtEur(avgPriceEur)}` : "")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      marginTop: 2
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.textDim
+    }
+  }, "Inversi\xF3n total:"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontWeight: 600
+    }
+  }, fmtEur(form.currency !== "EUR" ? toEur(totalCost, avgEcbRate) : totalCost))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginTop: 8
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    onClick: submitAll,
+    disabled: !form.ticker || lots.length === 0 && (!lotForm.shares || !lotForm.price),
+    style: {
+      fontSize: 12,
+      padding: "8px 20px"
+    }
+  }, "Aceptar \u2014 ", totalShares, " acciones a ", currSym, fmt(avgPrice)), /*#__PURE__*/React.createElement(Btn, {
+    variant: "ghost",
+    onClick: () => setModal(null)
+  }, "Cancelar")));
+}
+function CarteraTab({
+  holdings,
+  removeHolding,
+  openAddHolding,
+  cs
+}) {
+  const acciones = holdings.filter(h => h.type === "accion");
+  const fondos = holdings.filter(h => h.type === "fondo");
+  const withPrice = holdings.filter(h => h.currentPrice != null);
+
+  // Sectors
+  const sectors = {};
+  withPrice.forEach(h => {
+    const rateNow = h.ecbRateNow || h.ecbRateBuy || 1;
+    const curEur = h.currency !== "EUR" ? toEur(h.currentPrice, rateNow) : h.currentPrice;
+    const v = h.shares * curEur;
+    sectors[h.sector] = (sectors[h.sector] || 0) + v;
+  });
+  const totalVal = Object.values(sectors).reduce((a, b) => a + b, 0);
+  const sectorColors = [C.accent, C.blue, C.amber, C.red, C.purple, "#ec4899", "#14b8a6", "#f97316"];
+
+  // ─── SECTOR AUTO-DETECT ───
+
+  const colGrid = "1.3fr 0.65fr 0.6fr 0.5fr 0.55fr 0.65fr 0.7fr 0.45fr 0.6fr 0.5fr 0.45fr 26px";
+  const [sortKey, setSortKey] = useState(null);
+  const [sortDir, setSortDir] = useState("desc");
+  const toggleSort = key => {
+    if (sortKey === key) {
+      setSortDir(sortDir === "desc" ? "asc" : "desc");
+    } else {
+      setSortKey(key);
+      setSortDir("desc");
+    }
+  };
+  const columns = [{
+    key: "ticker",
+    label: "Activo",
+    align: "left"
+  }, {
+    key: "sector",
+    label: "Sector",
+    align: "left"
+  }, {
+    key: "cotizacion",
+    label: "Cotización",
+    align: "right"
+  }, {
+    key: "shares",
+    label: "Acciones",
+    align: "right"
+  }, {
+    key: "avgPrice",
+    label: "P. Medio",
+    align: "right"
+  }, {
+    key: "valorCompra",
+    label: "V. Compra",
+    align: "right"
+  }, {
+    key: "valorMercado",
+    label: "V. Mercado",
+    align: "right"
+  }, {
+    key: "dayChangePct",
+    label: "Día",
+    align: "right"
+  }, {
+    key: "pl",
+    label: "P/L €",
+    align: "right"
+  }, {
+    key: "plPct",
+    label: "P/L %",
+    align: "right"
+  }, {
+    key: "peso",
+    label: "Peso %",
+    align: "right"
+  }];
+  const TH = () => /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: colGrid,
+      gap: 4,
+      padding: "7px 12px",
+      fontSize: 8,
+      color: C.textDim,
+      textTransform: "uppercase",
+      letterSpacing: 0.8,
+      borderBottom: "2px solid " + C.border,
+      minWidth: 960
+    }
+  }, columns.map(col => /*#__PURE__*/React.createElement("div", {
+    key: col.key,
+    onClick: () => toggleSort(col.key),
+    style: {
+      textAlign: col.align,
+      cursor: "pointer",
+      userSelect: "none"
+    }
+  }, col.label, " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: sortKey === col.key ? C.accent : C.textMuted,
+      fontSize: 7,
+      marginLeft: 1
+    }
+  }, sortKey === col.key ? sortDir === "desc" ? "▼" : "▲" : "⇅"))), /*#__PURE__*/React.createElement("div", null));
+  const totalPortfolioEur = withPrice.reduce((s, h) => {
+    const rn = h.ecbRateNow || h.ecbRateBuy || 1;
+    const ce = h.currency !== "EUR" ? toEur(h.currentPrice, rn) : h.currentPrice;
+    return s + h.shares * ce;
+  }, 0);
+  const enrichHolding = h => {
+    const hasPrice = h.currentPrice != null;
+    const isForeign = h.currency !== "EUR";
+    const rateBuy = h.ecbRateBuy || 1;
+    const rateNow = h.ecbRateNow || rateBuy;
+    const avgEur = isForeign ? toEur(h.avgPrice, rateBuy) : h.avgPrice;
+    const curEur = hasPrice ? isForeign ? toEur(h.currentPrice, rateNow) : h.currentPrice : null;
+    const valorCompra = avgEur * h.shares;
+    const valorMercado = hasPrice ? curEur * h.shares : null;
+    const pl = hasPrice ? valorMercado - valorCompra : null;
+    const plPct = hasPrice ? pctChange(curEur, avgEur) : null;
+    const peso = hasPrice && totalPortfolioEur > 0 ? valorMercado / totalPortfolioEur * 100 : null;
+    const cotizacion = h.currentPrice || 0;
+    const currSym = {
+      "USD": "$",
+      "GBP": "£",
+      "CAD": "C$",
+      "AUD": "A$",
+      "EUR": "€"
+    }[h.currency] || "€";
+    return {
+      ...h,
+      hasPrice,
+      isForeign,
+      avgEur,
+      curEur,
+      valorCompra,
+      valorMercado,
+      pl,
+      plPct,
+      peso,
+      cotizacion,
+      currSym
+    };
+  };
+  const sortHoldings = list => {
+    const enriched = list.map(enrichHolding);
+    if (!sortKey) return enriched;
+    enriched.sort((a, b) => {
+      let va = a[sortKey],
+        vb = b[sortKey];
+      if (typeof va === "string") va = va.toLowerCase();
+      if (typeof vb === "string") vb = vb.toLowerCase();
+      if (va == null) va = -Infinity;
+      if (vb == null) vb = -Infinity;
+      if (va < vb) return sortDir === "asc" ? -1 : 1;
+      if (va > vb) return sortDir === "asc" ? 1 : -1;
+      return 0;
+    });
+    return enriched;
+  };
+  const Row = ({
+    h
+  }) => {
+    const d = h.hasPrice !== undefined ? h : enrichHolding(h);
+    const up = d.pl >= 0;
+    return /*#__PURE__*/React.createElement("div", {
+      className: "row",
+      style: {
+        display: "grid",
+        gridTemplateColumns: colGrid,
+        gap: 4,
+        alignItems: "center",
+        padding: "9px 12px",
+        borderBottom: "1px solid " + C.border,
+        transition: "background 0.1s",
+        minWidth: 960
+      }
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 4
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontWeight: 600,
+        fontSize: 13
+      }
+    }, d.ticker), d.isForeign && /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 7,
+        padding: "1px 4px",
+        borderRadius: 3,
+        background: C.blueDim,
+        color: C.blue,
+        fontWeight: 600
+      }
+    }, d.currency)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: C.textDim,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap"
+      }
+    }, d.name)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: C.textDim
+      }
+    }, d.sector || "—"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "right",
+        fontSize: 12,
+        fontWeight: 600,
+        color: d.hasPrice ? C.text : C.textMuted
+      }
+    }, d.hasPrice ? d.currSym + fmt(d.currentPrice) : "—"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "right",
+        fontWeight: 500
+      }
+    }, d.shares), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "right",
+        fontSize: 12
+      }
+    }, d.currSym, fmt(d.avgPrice)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "right",
+        fontSize: 12
+      }
+    }, fmtEur(d.valorCompra)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "right",
+        fontWeight: 600,
+        fontSize: 12
+      }
+    }, d.hasPrice ? fmtEur(d.valorMercado) : "—"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "right"
+      }
+    }, d.dayChangePct != null ? /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 11,
+        fontWeight: 600,
+        color: d.dayChange >= 0 ? C.accent : C.red
+      }
+    }, fmtPct(d.dayChangePct)) : /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.textMuted
+      }
+    }, "\u2014")), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "right"
+      }
+    }, d.hasPrice ? /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontWeight: 600,
+        color: up ? C.accent : C.red,
+        fontSize: 12
+      }
+    }, fmtEur(d.pl)) : /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.textMuted
+      }
+    }, "\u2014")), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "right"
+      }
+    }, d.hasPrice ? /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontWeight: 600,
+        color: up ? C.accent : C.red,
+        fontSize: 11
+      }
+    }, fmtPct(d.plPct)) : /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.textMuted
+      }
+    }, "\u2014")), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "right",
+        fontSize: 11,
+        color: C.textDim
+      }
+    }, d.peso != null ? fmt(d.peso, 1) + "%" : "—"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "center"
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      onClick: () => removeHolding(d.id),
+      style: {
+        background: "none",
+        border: "none",
+        color: C.textMuted,
+        cursor: "pointer",
+        padding: 3
+      }
+    }, /*#__PURE__*/React.createElement(TrashI, null))));
+  };
+  const PieChart = ({
+    data,
+    colors,
+    size = 180
+  }) => {
+    const total = data.reduce((s, d) => s + d.value, 0);
+    if (total === 0) return null;
+    const cx = size / 2,
+      cy = size / 2,
+      r = size / 2 - 4;
+    let cumAngle = -Math.PI / 2;
+    const slices = data.map((d, i) => {
+      const angle = d.value / total * 2 * Math.PI;
+      const startX = cx + r * Math.cos(cumAngle);
+      const startY = cy + r * Math.sin(cumAngle);
+      cumAngle += angle;
+      const endX = cx + r * Math.cos(cumAngle);
+      const endY = cy + r * Math.sin(cumAngle);
+      const largeArc = angle > Math.PI ? 1 : 0;
+      const path = data.length === 1 ? `M ${cx} ${cy - r} A ${r} ${r} 0 1 1 ${cx - 0.01} ${cy - r} Z` : `M ${cx} ${cy} L ${startX} ${startY} A ${r} ${r} 0 ${largeArc} 1 ${endX} ${endY} Z`;
+      return {
+        ...d,
+        path,
+        color: colors[i % colors.length]
+      };
+    });
+    return /*#__PURE__*/React.createElement("svg", {
+      width: size,
+      height: size,
+      viewBox: `0 0 ${size} ${size}`
+    }, slices.map((s, i) => /*#__PURE__*/React.createElement("path", {
+      key: i,
+      d: s.path,
+      fill: s.color,
+      stroke: "#fff",
+      strokeWidth: "2"
+    }, /*#__PURE__*/React.createElement("title", null, s.name, ": ", fmt(s.value / total * 100, 1), "%"))), /*#__PURE__*/React.createElement("circle", {
+      cx: cx,
+      cy: cy,
+      r: r * 0.55,
+      fill: "#fff"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: cx,
+      y: cy - 6,
+      textAnchor: "middle",
+      fontSize: "13",
+      fontWeight: "700",
+      fill: C.text,
+      fontFamily: "'DM Sans',sans-serif"
+    }, fmtEur(total)), /*#__PURE__*/React.createElement("text", {
+      x: cx,
+      y: cy + 10,
+      textAnchor: "middle",
+      fontSize: "9",
+      fill: C.textDim,
+      fontFamily: "'DM Sans',sans-serif"
+    }, "Valor total"));
+  };
+  const sortedAcciones = sortHoldings(acciones);
+  const sortedFondos = sortHoldings(fondos);
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      animation: "fadeIn 0.3s"
+    }
+  }, totalVal > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...cs,
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontFamily: "'DM Sans',sans-serif",
+      fontSize: 14,
+      margin: 0,
+      fontWeight: 600
+    }
+  }, "Distribuci\xF3n por Sector"), /*#__PURE__*/React.createElement(Btn, {
+    onClick: () => openAddHolding(),
+    style: {
+      fontSize: 10,
+      padding: "5px 10px"
+    }
+  }, /*#__PURE__*/React.createElement(PlusI, null), " Posici\xF3n")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: 30,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement(PieChart, {
+    data: Object.entries(sectors).map(([name, value]) => ({
+      name,
+      value
+    })),
+    colors: sectorColors,
+    size: 180
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 6,
+      minWidth: 160
+    }
+  }, Object.entries(sectors).map(([n, v], i) => /*#__PURE__*/React.createElement("div", {
+    key: n,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 10,
+      height: 10,
+      borderRadius: 3,
+      background: sectorColors[i % sectorColors.length],
+      flexShrink: 0
+    }
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      color: C.text,
+      flex: 1
+    }
+  }, n), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 600,
+      fontFamily: "'DM Mono', monospace"
+    }
+  }, fmt(v / totalVal * 100, 1), "%"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: C.textDim,
+      fontFamily: "'DM Mono', monospace",
+      minWidth: 70,
+      textAlign: "right"
+    }
+  }, fmtEur(v))))))), totalVal === 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...cs,
+      marginBottom: 14,
+      textAlign: "center"
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    onClick: () => openAddHolding()
+  }, /*#__PURE__*/React.createElement(PlusI, null), " A\xF1adir primera posici\xF3n")), acciones.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...cs,
+      marginBottom: 14,
+      padding: 0,
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "12px 12px 0",
+      display: "flex",
+      alignItems: "center",
+      gap: 6
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 5,
+      height: 5,
+      borderRadius: "50%",
+      background: C.accent
+    }
+  }), /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontFamily: "'DM Sans',sans-serif",
+      fontSize: 13,
+      margin: 0,
+      fontWeight: 600
+    }
+  }, "Acciones"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: C.textDim
+    }
+  }, "(", acciones.length, ")")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 6
+    }
+  }, /*#__PURE__*/React.createElement(TH, null), sortedAcciones.map(h => /*#__PURE__*/React.createElement(Row, {
+    key: h.id,
+    h: h
+  })))), fondos.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...cs,
+      padding: 0,
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "12px 12px 0",
+      display: "flex",
+      alignItems: "center",
+      gap: 6
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 5,
+      height: 5,
+      borderRadius: "50%",
+      background: C.blue
+    }
+  }), /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontFamily: "'DM Sans',sans-serif",
+      fontSize: 13,
+      margin: 0,
+      fontWeight: 600
+    }
+  }, "Fondos / ETFs"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: C.textDim
+    }
+  }, "(", fondos.length, ")")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 6
+    }
+  }, /*#__PURE__*/React.createElement(TH, null), sortedFondos.map(h => /*#__PURE__*/React.createElement(Row, {
+    key: h.id,
+    h: h
+  })))));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// VENTAS / IRPF TAB
+// ═══════════════════════════════════════════════════════════════════════
+function SaleForm({
+  addSale,
+  proxyUrl,
+  setModal
+}) {
+  const [f, sF] = useState({
+    ticker: "",
+    name: "",
+    sellDate: "",
+    buyDate: "",
+    shares: "",
+    buyPrice: "",
+    sellPrice: "",
+    buyFees: "",
+    sellFees: "",
+    currency: "EUR"
+  });
+  const [ecbBuy, setEcbBuy] = useState(null);
+  const [ecbSell, setEcbSell] = useState(null);
+  const [ecbLoading, setEcbLoading] = useState(false);
+  const [searchResults, setSearchResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const debounceRef = useRef(null);
+
+  // Ticker search with debounce
+  const searchTicker = q => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (!q || !proxyUrl) {
+      setSearchResults([]);
+      return;
+    }
+    debounceRef.current = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const r = await finnhubSearch(q, proxyUrl);
+        setSearchResults(r);
+      } catch {
+        setSearchResults([]);
+      }
+      setSearching(false);
+    }, 400);
+  };
+  const selectTicker = r => {
+    const isUS = !r.symbol.includes(".");
+    sF(prev => ({
+      ...prev,
+      ticker: r.displaySymbol || r.symbol,
+      name: r.description || r.symbol,
+      currency: isUS ? "USD" : "EUR"
+    }));
+    setSearchResults([]);
+  };
+
+  // ECB rates
+  useEffect(() => {
+    if (f.currency !== "EUR") {
+      setEcbLoading(true);
+      Promise.all([f.buyDate ? getECBRate(f.buyDate, f.currency) : Promise.resolve(null), f.sellDate ? getECBRate(f.sellDate, f.currency) : Promise.resolve(null)]).then(([rb, rs]) => {
+        setEcbBuy(rb);
+        setEcbSell(rs);
+        setEcbLoading(false);
+      });
+    } else {
+      setEcbBuy(null);
+      setEcbSell(null);
+    }
+  }, [f.currency, f.buyDate, f.sellDate]);
+  const submit = () => {
+    if (!f.ticker || !f.shares || !f.buyPrice || !f.sellPrice) return;
+    if (f.currency !== "EUR" && (!ecbBuy || !ecbSell)) return;
+    addSale({
+      ...f,
+      shares: +f.shares,
+      buyPrice: +f.buyPrice,
+      sellPrice: +f.sellPrice,
+      buyFees: Math.abs(+f.buyFees) || 0,
+      sellFees: Math.abs(+f.sellFees) || 0,
+      fees: 0,
+      ecbRateBuy: f.currency !== "EUR" && ecbBuy ? ecbBuy.rate : 1,
+      ecbRateSell: f.currency !== "EUR" && ecbSell ? ecbSell.rate : 1
+    });
+    setModal(null);
+  };
+  const isForeign = f.currency !== "EUR";
+  const currSym = {
+    "USD": "$",
+    "GBP": "\u00a3",
+    "CAD": "C$",
+    "AUD": "A$",
+    "EUR": "\u20ac"
+  }[f.currency] || "\u20ac";
+  const buyTotalEur = isForeign && ecbBuy && f.buyPrice ? toEur(Math.abs(+f.buyPrice), ecbBuy.rate) : Math.abs(+f.buyPrice) || 0;
+  const sellTotalEur = isForeign && ecbSell && f.sellPrice ? toEur(Math.abs(+f.sellPrice), ecbSell.rate) : Math.abs(+f.sellPrice) || 0;
+  const nShares = Math.abs(+f.shares) || 0;
+  const bFees = Math.abs(+f.buyFees) || 0;
+  const sFees = Math.abs(+f.sellFees) || 0;
+  const vAdqP = buyTotalEur > 0 ? buyTotalEur + bFees : null;
+  const vTransP = sellTotalEur > 0 ? sellTotalEur - sFees : null;
+  const plP = vAdqP != null && vTransP != null ? vTransP - vAdqP : null;
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontFamily: "'DM Sans',sans-serif",
+      fontSize: 15,
+      marginBottom: 14,
+      color: C.amber
+    }
+  }, "Registrar Venta"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "relative"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 2fr",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement(Input, {
+    label: "Ticker",
+    value: f.ticker,
+    onChange: e => {
+      sF({
+        ...f,
+        ticker: e.target.value.toUpperCase()
+      });
+      searchTicker(e.target.value);
+    },
+    placeholder: "AAPL, MC..."
+  }), /*#__PURE__*/React.createElement(Input, {
+    label: "Nombre",
+    value: f.name,
+    onChange: e => sF({
+      ...f,
+      name: e.target.value
+    }),
+    placeholder: "Se rellena autom\xE1ticamente"
+  })), searching && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: C.textDim,
+      marginTop: -8,
+      marginBottom: 8
+    }
+  }, "Buscando..."), searchResults.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      top: 58,
+      left: 0,
+      right: 0,
+      zIndex: 10,
+      background: C.card,
+      border: `1px solid ${C.border}`,
+      borderRadius: 6,
+      maxHeight: 180,
+      overflowY: "auto",
+      boxShadow: "0 4px 12px rgba(0,0,0,0.1)"
+    }
+  }, searchResults.map((r, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    onClick: () => selectTicker(r),
+    className: "row",
+    style: {
+      padding: "8px 10px",
+      cursor: "pointer",
+      borderBottom: `1px solid ${C.border}`,
+      fontSize: 11,
+      display: "flex",
+      justifyContent: "space-between"
+    }
+  }, /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: C.accent
+    }
+  }, r.displaySymbol || r.symbol), " ", " \u2014 ", " ", r.description), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.textMuted,
+      fontSize: 9
+    }
+  }, r.type))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr 1fr",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement(Select, {
+    label: "Divisa",
+    value: f.currency,
+    onChange: e => sF({
+      ...f,
+      currency: e.target.value
+    })
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "EUR"
+  }, "EUR ", "\u20ac"), /*#__PURE__*/React.createElement("option", {
+    value: "USD"
+  }, "USD $"), /*#__PURE__*/React.createElement("option", {
+    value: "GBP"
+  }, "GBP ", "\u00a3"), /*#__PURE__*/React.createElement("option", {
+    value: "CAD"
+  }, "CAD C$"), /*#__PURE__*/React.createElement("option", {
+    value: "AUD"
+  }, "AUD A$")), /*#__PURE__*/React.createElement(Input, {
+    label: "Fecha Compra",
+    type: "date",
+    value: f.buyDate,
+    onChange: e => sF({
+      ...f,
+      buyDate: e.target.value
+    })
+  }), /*#__PURE__*/React.createElement(Input, {
+    label: "Fecha Venta",
+    type: "date",
+    value: f.sellDate,
+    onChange: e => sF({
+      ...f,
+      sellDate: e.target.value
+    })
+  })), /*#__PURE__*/React.createElement(Input, {
+    label: "N\u00ba Acciones",
+    type: "number",
+    value: f.shares,
+    onChange: e => sF({
+      ...f,
+      shares: e.target.value
+    })
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "8px 10px",
+      borderRadius: 6,
+      background: C.accentDim,
+      border: `1px solid ${C.accent}15`,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: C.accent,
+      fontWeight: 600,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      marginBottom: 6
+    }
+  }, "Adquisici\u00f3n (compra)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement(Input, {
+    label: `Valor compra (${currSym})`,
+    type: "number",
+    step: "0.01",
+    value: f.buyPrice,
+    onChange: e => sF({
+      ...f,
+      buyPrice: e.target.value
+    })
+  }), /*#__PURE__*/React.createElement(Input, {
+    label: "Comisi\u00f3n compra (\u20ac)",
+    type: "number",
+    step: "0.01",
+    value: f.buyFees,
+    onChange: e => sF({
+      ...f,
+      buyFees: e.target.value
+    })
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "8px 10px",
+      borderRadius: 6,
+      background: C.redDim,
+      border: `1px solid ${C.red}15`,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: C.red,
+      fontWeight: 600,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      marginBottom: 6
+    }
+  }, "Transmisi\u00f3n (venta)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement(Input, {
+    label: `Valor venta (${currSym})`,
+    type: "number",
+    step: "0.01",
+    value: f.sellPrice,
+    onChange: e => sF({
+      ...f,
+      sellPrice: e.target.value
+    })
+  }), /*#__PURE__*/React.createElement(Input, {
+    label: "Comisi\u00f3n venta (\u20ac)",
+    type: "number",
+    step: "0.01",
+    value: f.sellFees,
+    onChange: e => sF({
+      ...f,
+      sellFees: e.target.value
+    })
+  }))), isForeign && (f.buyDate || f.sellDate) && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "10px 12px",
+      borderRadius: 6,
+      marginBottom: 10,
+      fontSize: 10,
+      background: C.blueDim,
+      border: `1px solid ${C.blue}20`,
+      lineHeight: 1.8
+    }
+  }, ecbLoading ? /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.textDim
+    }
+  }, "Consultando tipos BCE...") : /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.blue
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 600,
+      marginBottom: 4,
+      fontSize: 11
+    }
+  }, "Tipos de cambio BCE oficiales"), ecbBuy && /*#__PURE__*/React.createElement("div", null, "Compra (", ecbBuy.date, "): 1 EUR = ", fmt(ecbBuy.rate, 4), " ", f.currency, f.buyPrice ? ` \u2192 ${Math.abs(+f.buyPrice)}${currSym} = ${fmtEur(buyTotalEur)}` : ""), ecbSell && /*#__PURE__*/React.createElement("div", null, "Venta (", ecbSell.date, "): 1 EUR = ", fmt(ecbSell.rate, 4), " ", f.currency, f.sellPrice ? ` \u2192 ${Math.abs(+f.sellPrice)}${currSym} = ${fmtEur(sellTotalEur)}` : ""))), plP != null && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "10px 12px",
+      borderRadius: 6,
+      marginBottom: 10,
+      fontSize: 11,
+      background: `${plP >= 0 ? C.accent : C.red}06`,
+      border: `1px solid ${plP >= 0 ? C.accent : C.red}20`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      color: C.textDim,
+      fontSize: 10
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "V. ", "Adquisici\u00f3n", ": ", fmtEur(vAdqP)), /*#__PURE__*/React.createElement("span", null, "V. ", "Transmisi\u00f3n", ": ", fmtEur(vTransP))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      color: plP >= 0 ? C.accent : C.red,
+      marginTop: 4,
+      fontSize: 13
+    }
+  }, "P/L: ", fmtEur(plP))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginTop: 6
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    onClick: submit,
+    disabled: isForeign && (!ecbBuy || !ecbSell),
+    style: {
+      background: C.amber,
+      color: "#fff"
+    }
+  }, /*#__PURE__*/React.createElement(PlusI, null), " Registrar"), /*#__PURE__*/React.createElement(Btn, {
+    variant: "ghost",
+    onClick: () => setModal(null)
+  }, "Cancelar")));
+}
+function EditSaleForm({
+  sale,
+  updateSale,
+  proxyUrl,
+  setModal
+}) {
+  const [f, sF] = useState({
+    ticker: sale.ticker || "",
+    name: sale.name || "",
+    sellDate: sale.sellDate || "",
+    buyDate: sale.buyDate || "",
+    shares: String(sale.shares || ""),
+    buyPrice: String(sale.buyPrice || ""),
+    sellPrice: String(sale.sellPrice || ""),
+    buyFees: String(sale.buyFees || ""),
+    sellFees: String(sale.sellFees || ""),
+    currency: sale.currency || "EUR"
+  });
+  const [ecbBuy, setEcbBuy] = useState(null);
+  const [ecbSell, setEcbSell] = useState(null);
+  const [ecbLoading, setEcbLoading] = useState(false);
+  useEffect(() => {
+    if (f.currency !== "EUR") {
+      setEcbLoading(true);
+      Promise.all([f.buyDate ? getECBRate(f.buyDate, f.currency) : Promise.resolve(null), f.sellDate ? getECBRate(f.sellDate, f.currency) : Promise.resolve(null)]).then(([rb, rs]) => {
+        setEcbBuy(rb);
+        setEcbSell(rs);
+        setEcbLoading(false);
+      });
+    } else {
+      setEcbBuy(null);
+      setEcbSell(null);
+    }
+  }, [f.currency, f.buyDate, f.sellDate]);
+  const submit = () => {
+    if (!f.ticker || !f.shares || !f.buyPrice || !f.sellPrice) return;
+    updateSale(sale.id, {
+      ...f,
+      shares: +f.shares,
+      buyPrice: +f.buyPrice,
+      sellPrice: +f.sellPrice,
+      buyFees: Math.abs(+f.buyFees) || 0,
+      sellFees: Math.abs(+f.sellFees) || 0,
+      ecbRateBuy: f.currency !== "EUR" && ecbBuy ? ecbBuy.rate : sale.ecbRateBuy || 1,
+      ecbRateSell: f.currency !== "EUR" && ecbSell ? ecbSell.rate : sale.ecbRateSell || 1
+    });
+    setModal(null);
+  };
+  const isForeign = f.currency !== "EUR";
+  const currSym = {
+    "USD": "$",
+    "GBP": "\u00a3",
+    "CAD": "C$",
+    "AUD": "A$",
+    "EUR": "\u20ac"
+  }[f.currency] || "\u20ac";
+  const buyTotalEur = isForeign && ecbBuy && f.buyPrice ? toEur(Math.abs(+f.buyPrice), ecbBuy.rate) : Math.abs(+f.buyPrice) || 0;
+  const sellTotalEur = isForeign && ecbSell && f.sellPrice ? toEur(Math.abs(+f.sellPrice), ecbSell.rate) : Math.abs(+f.sellPrice) || 0;
+  const bFees = Math.abs(+f.buyFees) || 0;
+  const sFees = Math.abs(+f.sellFees) || 0;
+  const vAdqP = buyTotalEur > 0 ? buyTotalEur + bFees : null;
+  const vTransP = sellTotalEur > 0 ? sellTotalEur - sFees : null;
+  const plP = vAdqP != null && vTransP != null ? vTransP - vAdqP : null;
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontFamily: "'DM Sans',sans-serif",
+      fontSize: 15,
+      marginBottom: 14,
+      color: C.blue
+    }
+  }, "Editar Venta \u2014 ", sale.ticker), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 2fr",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement(Input, {
+    label: "Ticker",
+    value: f.ticker,
+    onChange: e => sF({
+      ...f,
+      ticker: e.target.value.toUpperCase()
+    })
+  }), /*#__PURE__*/React.createElement(Input, {
+    label: "Nombre",
+    value: f.name,
+    onChange: e => sF({
+      ...f,
+      name: e.target.value
+    })
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr 1fr",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement(Select, {
+    label: "Divisa",
+    value: f.currency,
+    onChange: e => sF({
+      ...f,
+      currency: e.target.value
+    })
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "EUR"
+  }, "EUR ", "\u20ac"), /*#__PURE__*/React.createElement("option", {
+    value: "USD"
+  }, "USD $"), /*#__PURE__*/React.createElement("option", {
+    value: "GBP"
+  }, "GBP ", "\u00a3"), /*#__PURE__*/React.createElement("option", {
+    value: "CAD"
+  }, "CAD C$"), /*#__PURE__*/React.createElement("option", {
+    value: "AUD"
+  }, "AUD A$")), /*#__PURE__*/React.createElement(Input, {
+    label: "Fecha Compra",
+    type: "date",
+    value: f.buyDate,
+    onChange: e => sF({
+      ...f,
+      buyDate: e.target.value
+    })
+  }), /*#__PURE__*/React.createElement(Input, {
+    label: "Fecha Venta",
+    type: "date",
+    value: f.sellDate,
+    onChange: e => sF({
+      ...f,
+      sellDate: e.target.value
+    })
+  })), /*#__PURE__*/React.createElement(Input, {
+    label: "N\u00ba Acciones",
+    type: "number",
+    value: f.shares,
+    onChange: e => sF({
+      ...f,
+      shares: e.target.value
+    })
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "8px 10px",
+      borderRadius: 6,
+      background: C.accentDim,
+      border: `1px solid ${C.accent}15`,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: C.accent,
+      fontWeight: 600,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      marginBottom: 6
+    }
+  }, "Adquisici\u00f3n (compra)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement(Input, {
+    label: `Valor compra (${currSym})`,
+    type: "number",
+    step: "0.01",
+    value: f.buyPrice,
+    onChange: e => sF({
+      ...f,
+      buyPrice: e.target.value
+    })
+  }), /*#__PURE__*/React.createElement(Input, {
+    label: "Comisi\u00f3n compra (\u20ac)",
+    type: "number",
+    step: "0.01",
+    value: f.buyFees,
+    onChange: e => sF({
+      ...f,
+      buyFees: e.target.value
+    })
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "8px 10px",
+      borderRadius: 6,
+      background: C.redDim,
+      border: `1px solid ${C.red}15`,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: C.red,
+      fontWeight: 600,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      marginBottom: 6
+    }
+  }, "Transmisi\u00f3n (venta)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement(Input, {
+    label: `Valor venta (${currSym})`,
+    type: "number",
+    step: "0.01",
+    value: f.sellPrice,
+    onChange: e => sF({
+      ...f,
+      sellPrice: e.target.value
+    })
+  }), /*#__PURE__*/React.createElement(Input, {
+    label: "Comisi\u00f3n venta (\u20ac)",
+    type: "number",
+    step: "0.01",
+    value: f.sellFees,
+    onChange: e => sF({
+      ...f,
+      sellFees: e.target.value
+    })
+  }))), isForeign && (f.buyDate || f.sellDate) && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "10px 12px",
+      borderRadius: 6,
+      marginBottom: 10,
+      fontSize: 10,
+      background: C.blueDim,
+      border: `1px solid ${C.blue}20`,
+      lineHeight: 1.8
+    }
+  }, ecbLoading ? /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.textDim
+    }
+  }, "Consultando tipos BCE...") : /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.blue
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 600,
+      marginBottom: 4,
+      fontSize: 11
+    }
+  }, "Tipos de cambio BCE"), ecbBuy && /*#__PURE__*/React.createElement("div", null, "Compra (", ecbBuy.date, "): 1 EUR = ", fmt(ecbBuy.rate, 4), " ", f.currency), ecbSell && /*#__PURE__*/React.createElement("div", null, "Venta (", ecbSell.date, "): 1 EUR = ", fmt(ecbSell.rate, 4), " ", f.currency))), plP != null && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "10px 12px",
+      borderRadius: 6,
+      marginBottom: 10,
+      fontSize: 11,
+      background: `${plP >= 0 ? C.accent : C.red}06`,
+      border: `1px solid ${plP >= 0 ? C.accent : C.red}20`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      color: C.textDim,
+      fontSize: 10
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "V. ", "Adquisici\u00f3n", ": ", fmtEur(vAdqP)), /*#__PURE__*/React.createElement("span", null, "V. ", "Transmisi\u00f3n", ": ", fmtEur(vTransP))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      color: plP >= 0 ? C.accent : C.red,
+      marginTop: 4,
+      fontSize: 13
+    }
+  }, "P/L: ", fmtEur(plP))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginTop: 6
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    onClick: submit,
+    style: {
+      background: C.blue,
+      color: "#fff"
+    }
+  }, /*#__PURE__*/React.createElement(EditI, null), " Guardar cambios"), /*#__PURE__*/React.createElement(Btn, {
+    variant: "ghost",
+    onClick: () => setModal(null)
+  }, "Cancelar")));
+}
+function VentasTab({
+  sales,
+  removeSale,
+  openAddSale,
+  openEditSale,
+  cs
+}) {
+  const years = [...new Set(sales.map(s => s.sellDate?.slice(0, 4)))].sort().reverse();
+  const [year, setYear] = useState(years[0] || "2026");
+  const filtered = sales.filter(s => s.sellDate?.startsWith(year));
+  const saleDetails = filtered.map(s => {
+    const isForeign = s.currency !== "EUR";
+    const rateBuy = s.ecbRateBuy || 1;
+    const rateSell = s.ecbRateSell || 1;
+    const buyTotalEur = isForeign ? toEur(s.buyPrice, rateBuy) : s.buyPrice;
+    const sellTotalEur = isForeign ? toEur(s.sellPrice, rateSell) : s.sellPrice;
+    const buyFees = s.buyFees || 0;
+    const sellFees = s.sellFees || s.fees || 0;
+    const valorAdq = buyTotalEur + buyFees;
+    const valorTrans = sellTotalEur - sellFees;
+    const pl = valorTrans - valorAdq;
+    return {
+      ...s,
+      isForeign,
+      rateBuy,
+      rateSell,
+      buyTotalEur,
+      sellTotalEur,
+      buyFees,
+      sellFees,
+      valorAdq,
+      valorTrans,
+      pl
+    };
+  });
+  const sumAdq = saleDetails.reduce((s, x) => s + x.valorAdq, 0);
+  const sumTrans = saleDetails.reduce((s, x) => s + x.valorTrans, 0);
+  const sumPL = sumTrans - sumAdq;
+  const totalGains = saleDetails.reduce((s, x) => x.pl > 0 ? s + x.pl : s, 0);
+  const totalLosses = saleDetails.reduce((s, x) => x.pl < 0 ? s + x.pl : s, 0);
+  const netPL = totalGains + totalLosses;
+  const calcTax = g => {
+    if (g <= 0) return 0;
+    let rem = g,
+      tax = 0;
+    for (const [sz, rt] of [[6000, 0.19], [44000, 0.21], [150000, 0.23], [100000, 0.27], [Infinity, 0.28]]) {
+      const t = Math.min(rem, sz);
+      tax += t * rt;
+      rem -= t;
+      if (rem <= 0) break;
+    }
+    return tax;
+  };
+  const colTpl = "1.1fr 0.45fr 0.5fr 0.55fr 0.4fr 0.65fr 0.55fr 0.4fr 0.65fr 0.6fr 48px";
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      animation: "fadeIn 0.3s"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...cs,
+      marginBottom: 14,
+      background: "linear-gradient(135deg, #ffffff, #f8f7ff)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontFamily: "'DM Sans',sans-serif",
+      fontSize: 13,
+      margin: 0
+    }
+  }, "Resumen Fiscal \u2014 ", year), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("select", {
+    value: year,
+    onChange: e => setYear(e.target.value),
+    style: {
+      background: "#fff",
+      border: `1px solid ${C.border}`,
+      borderRadius: 6,
+      color: C.text,
+      padding: "4px 8px",
+      fontSize: 11,
+      fontFamily: "inherit"
+    }
+  }, years.map(y => /*#__PURE__*/React.createElement("option", {
+    key: y,
+    value: y
+  }, y))), /*#__PURE__*/React.createElement(Btn, {
+    onClick: () => openAddSale(),
+    style: {
+      fontSize: 10,
+      padding: "5px 10px",
+      background: C.amber,
+      color: "#fff"
+    }
+  }, /*#__PURE__*/React.createElement(PlusI, null), " Venta"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
+      gap: 10
+    }
+  }, [{
+    l: "Ganancias",
+    v: fmtEur(totalGains),
+    c: C.accent
+  }, {
+    l: "Pérdidas",
+    v: fmtEur(totalLosses),
+    c: C.red
+  }, {
+    l: "Resultado Neto",
+    v: fmtEur(netPL),
+    c: netPL >= 0 ? C.accent : C.red
+  }, {
+    l: "IRPF Estimado",
+    v: fmtEur(calcTax(netPL)),
+    c: C.amber
+  }].map((x, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      padding: 10,
+      borderRadius: 8,
+      background: `${x.c}06`,
+      border: `1px solid ${x.c}15`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 8,
+      color: C.textDim,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      marginBottom: 3
+    }
+  }, x.l), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      color: x.c
+    }
+  }, x.v)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      padding: "6px 10px",
+      borderRadius: 6,
+      background: `${C.amber}06`,
+      border: `1px solid ${C.amber}12`,
+      fontSize: 9,
+      color: C.textDim
+    }
+  }, "Tramos base ahorro: \u22646.000\u20AC\u219219% | 6k\u201350k\u219221% | 50k\u2013200k\u219223% | 200k\u2013300k\u219227% | +300k\u219228%. Estimaci\xF3n orientativa.")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...cs,
+      padding: 0,
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: colTpl,
+      gap: 3,
+      padding: "8px 10px 0",
+      minWidth: 920
+    }
+  }, /*#__PURE__*/React.createElement("div", null), /*#__PURE__*/React.createElement("div", null), /*#__PURE__*/React.createElement("div", null), /*#__PURE__*/React.createElement("div", {
+    style: {
+      gridColumn: "span 3",
+      textAlign: "center",
+      fontSize: 8,
+      fontWeight: 700,
+      color: C.accent,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      padding: "3px 0",
+      borderRadius: "4px 4px 0 0",
+      background: C.accentDim
+    }
+  }, "Adquisici\xF3n"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      gridColumn: "span 3",
+      textAlign: "center",
+      fontSize: 8,
+      fontWeight: 700,
+      color: C.red,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      padding: "3px 0",
+      borderRadius: "4px 4px 0 0",
+      background: C.redDim
+    }
+  }, "Transmisi\xF3n"), /*#__PURE__*/React.createElement("div", null), /*#__PURE__*/React.createElement("div", null)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: colTpl,
+      gap: 3,
+      padding: "4px 10px 6px",
+      fontSize: 8,
+      color: C.textDim,
+      textTransform: "uppercase",
+      letterSpacing: 0.7,
+      borderBottom: `2px solid ${C.border}`,
+      minWidth: 920
+    }
+  }, /*#__PURE__*/React.createElement("div", null, "Activo"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "center"
+    }
+  }, "Acciones"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "center"
+    }
+  }, "Tipo \u20AC/$"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, "Compra"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, "Comisi\xF3n"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      fontWeight: 700,
+      color: C.accent
+    }
+  }, "V. Adquisici\xF3n"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, "Venta"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, "Comisi\xF3n"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      fontWeight: 700,
+      color: C.red
+    }
+  }, "V. Transmisi\xF3n"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, "P/L"), /*#__PURE__*/React.createElement("div", null)), filtered.length === 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: 28,
+      textAlign: "center",
+      color: C.textDim,
+      fontSize: 11,
+      minWidth: 920
+    }
+  }, "Sin ventas en ", year), saleDetails.map(d => /*#__PURE__*/React.createElement("div", {
+    key: d.id,
+    className: "row",
+    style: {
+      display: "grid",
+      gridTemplateColumns: colTpl,
+      gap: 3,
+      alignItems: "center",
+      padding: "9px 10px",
+      borderBottom: `1px solid ${C.border}`,
+      transition: "background 0.1s",
+      minWidth: 920
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 4
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontWeight: 600,
+      fontSize: 11
+    }
+  }, d.ticker), d.isForeign && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 7,
+      padding: "1px 3px",
+      borderRadius: 2,
+      background: C.blueDim,
+      color: C.blue,
+      fontWeight: 600
+    }
+  }, "USD")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 8,
+      color: C.textDim
+    }
+  }, d.name), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 8,
+      color: C.textMuted
+    }
+  }, d.buyDate || "—", " \u2192 ", d.sellDate)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "center",
+      fontWeight: 500,
+      fontSize: 11
+    }
+  }, d.shares), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "center",
+      fontSize: 9
+    }
+  }, d.isForeign ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.blue,
+      fontWeight: 500
+    }
+  }, fmt(d.rateBuy, 4)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.blue,
+      fontWeight: 500
+    }
+  }, fmt(d.rateSell, 4))) : /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.textMuted
+    }
+  }, "\u2014")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      fontSize: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", null, fmtEur(d.buyTotalEur)), d.isForeign && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 8,
+      color: C.textDim
+    }
+  }, "$", fmt(d.buyPrice))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      fontSize: 10,
+      color: d.buyFees > 0 ? C.text : C.textMuted
+    }
+  }, d.buyFees > 0 ? fmtEur(d.buyFees) : "—"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      fontSize: 11,
+      fontWeight: 600
+    }
+  }, fmtEur(d.valorAdq)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      fontSize: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", null, fmtEur(d.sellTotalEur)), d.isForeign && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 8,
+      color: C.textDim
+    }
+  }, "$", fmt(d.sellPrice))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      fontSize: 10,
+      color: d.sellFees > 0 ? C.text : C.textMuted
+    }
+  }, d.sellFees > 0 ? fmtEur(d.sellFees) : "—"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      fontSize: 11,
+      fontWeight: 600
+    }
+  }, fmtEur(d.valorTrans)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      fontWeight: 700,
+      fontSize: 11,
+      color: d.pl >= 0 ? C.accent : C.red
+    }
+  }, fmtEur(d.pl)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 2,
+      justifyContent: "center"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => openEditSale(d),
+    style: {
+      background: "none",
+      border: "none",
+      color: C.blue,
+      cursor: "pointer",
+      padding: 3
+    }
+  }, /*#__PURE__*/React.createElement(EditI, null)), /*#__PURE__*/React.createElement("button", {
+    onClick: () => removeSale(d.id),
+    style: {
+      background: "none",
+      border: "none",
+      color: C.textMuted,
+      cursor: "pointer",
+      padding: 3
+    }
+  }, /*#__PURE__*/React.createElement(TrashI, null))))), saleDetails.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: colTpl,
+      gap: 3,
+      padding: "10px 10px",
+      background: C.cardAlt,
+      borderTop: `2px solid ${C.border}`,
+      fontSize: 11,
+      fontWeight: 700,
+      minWidth: 920
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.text,
+      textTransform: "uppercase",
+      fontSize: 9,
+      letterSpacing: 1
+    }
+  }, "Totales"), /*#__PURE__*/React.createElement("div", null), /*#__PURE__*/React.createElement("div", null), /*#__PURE__*/React.createElement("div", null), /*#__PURE__*/React.createElement("div", null), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      color: C.text
+    }
+  }, fmtEur(sumAdq)), /*#__PURE__*/React.createElement("div", null), /*#__PURE__*/React.createElement("div", null), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      color: C.text
+    }
+  }, fmtEur(sumTrans)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      color: sumPL >= 0 ? C.accent : C.red,
+      fontSize: 12
+    }
+  }, fmtEur(sumPL)), /*#__PURE__*/React.createElement("div", null))));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// RISK TAB
+// ═══════════════════════════════════════════════════════════════════════
+function RiesgoTab({
+  riskTrades,
+  addRiskTrade,
+  removeRiskTrade,
+  setModal,
+  cs
+}) {
+  const [c, sC] = useState({
+    capital: 10000,
+    riskPct: 1,
+    entry: "",
+    sl: "",
+    tp: ""
+  });
+  const e = +c.entry || 0,
+    sl = +c.sl || 0,
+    tp = +c.tp || 0;
+  const riskAmt = c.capital * c.riskPct / 100;
+  const rps = e && sl ? Math.abs(e - sl) : 0;
+  const posSize = rps > 0 ? Math.floor(riskAmt / rps) : 0;
+  const posVal = posSize * e;
+  const potLoss = posSize * rps;
+  const potGain = tp && e ? posSize * Math.abs(tp - e) : 0;
+  const rr = potLoss > 0 ? potGain / potLoss : 0;
+  const save = () => {
+    if (!e || !sl) return;
+    addRiskTrade({
+      ticker: "—",
+      entryPrice: e,
+      stopLoss: sl,
+      takeProfit: tp,
+      shares: posSize,
+      riskAmount: potLoss,
+      rr,
+      date: new Date().toISOString().slice(0, 10),
+      status: "abierta"
+    });
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      animation: "fadeIn 0.3s"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...cs,
+      marginBottom: 14,
+      background: "linear-gradient(135deg, #ffffff, #faf8ff)"
+    }
+  }, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontFamily: "'DM Sans',sans-serif",
+      fontSize: 13,
+      margin: "0 0 14px",
+      display: "flex",
+      alignItems: "center",
+      gap: 6
+    }
+  }, /*#__PURE__*/React.createElement(RiskI, null), " Calculadora de Posici\xF3n"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Input, {
+    label: "Capital Total (\u20AC)",
+    type: "number",
+    value: c.capital,
+    onChange: ev => sC({
+      ...c,
+      capital: +ev.target.value || 0
+    })
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: {
+      fontSize: 9,
+      color: C.textDim,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      display: "block",
+      marginBottom: 3
+    }
+  }, "Riesgo: ", c.riskPct, "%"), /*#__PURE__*/React.createElement("input", {
+    type: "range",
+    min: "0.25",
+    max: "5",
+    step: "0.25",
+    value: c.riskPct,
+    onChange: ev => sC({
+      ...c,
+      riskPct: +ev.target.value
+    }),
+    style: {
+      width: "100%",
+      accentColor: C.red
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      fontSize: 8,
+      color: C.textDim
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "0.25%"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.amber,
+      fontWeight: 600
+    }
+  }, fmtEur(riskAmt)), /*#__PURE__*/React.createElement("span", null, "5%")))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Input, {
+    label: "Precio Entrada",
+    type: "number",
+    step: "0.01",
+    value: c.entry,
+    onChange: ev => sC({
+      ...c,
+      entry: ev.target.value
+    })
+  }), /*#__PURE__*/React.createElement(Input, {
+    label: "Stop Loss",
+    type: "number",
+    step: "0.01",
+    value: c.sl,
+    onChange: ev => sC({
+      ...c,
+      sl: ev.target.value
+    })
+  }), /*#__PURE__*/React.createElement(Input, {
+    label: "Take Profit",
+    type: "number",
+    step: "0.01",
+    value: c.tp,
+    onChange: ev => sC({
+      ...c,
+      tp: ev.target.value
+    })
+  }))), e > 0 && sl > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      padding: 14,
+      borderRadius: 8,
+      background: `${C.bg}`,
+      border: `1px solid ${C.border}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))",
+      gap: 10
+    }
+  }, [{
+    l: "Tamaño Posición",
+    v: `${posSize} uds.`,
+    s: fmtEur(posVal),
+    c: C.blue
+  }, {
+    l: "Pérdida Máxima",
+    v: fmtEur(potLoss),
+    s: `${c.riskPct}% capital`,
+    c: C.red
+  }, {
+    l: "Ganancia Potencial",
+    v: tp ? fmtEur(potGain) : "—",
+    s: tp ? fmtPct(pctChange(tp, e)) : "Sin TP",
+    c: C.accent
+  }, {
+    l: "Ratio R:R",
+    v: rr > 0 ? `1:${fmt(rr, 1)}` : "—",
+    s: rr >= 2 ? "Favorable" : rr >= 1 ? "Aceptable" : "Desfavorable",
+    c: rr >= 2 ? C.accent : rr >= 1 ? C.amber : C.red
+  }].map((x, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      padding: 10,
+      borderRadius: 8,
+      background: `${x.c}06`,
+      border: `1px solid ${x.c}15`,
+      textAlign: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 8,
+      color: C.textDim,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      marginBottom: 5
+    }
+  }, x.l), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 17,
+      fontWeight: 700,
+      color: x.c
+    }
+  }, x.v), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: C.textDim,
+      marginTop: 2
+    }
+  }, x.s)))), tp > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 3,
+      height: 24
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: Math.abs(e - sl),
+      background: `${C.red}33`,
+      borderRadius: "4px 0 0 4px",
+      height: "100%",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontSize: 8,
+      color: C.red,
+      fontWeight: 600,
+      minWidth: 36
+    }
+  }, "SL ", fmt(sl)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 2,
+      height: "100%",
+      background: C.amber,
+      borderRadius: 1
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: Math.abs(tp - e),
+      background: `${C.accent}33`,
+      borderRadius: "0 4px 4px 0",
+      height: "100%",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontSize: 8,
+      color: C.accent,
+      fontWeight: 600,
+      minWidth: 36
+    }
+  }, "TP ", fmt(tp))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "center",
+      fontSize: 8,
+      color: C.amber,
+      marginTop: 3
+    }
+  }, "Entrada: ", fmt(e))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    onClick: save,
+    style: {
+      background: C.blue,
+      color: "#fff",
+      fontSize: 10
+    }
+  }, "Guardar Operaci\xF3n")))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...cs,
+      padding: 0,
+      overflow: "hidden"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "12px 14px",
+      borderBottom: `1px solid ${C.border}`,
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontFamily: "'DM Sans',sans-serif",
+      fontSize: 12,
+      margin: 0
+    }
+  }, "Operaciones con Riesgo Controlado"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 9,
+      color: C.textDim
+    }
+  }, riskTrades.length, " ops.")), riskTrades.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: 28,
+      textAlign: "center",
+      color: C.textDim,
+      fontSize: 11
+    }
+  }, "Usa la calculadora para a\xF1adir operaciones") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "0.8fr 0.6fr 0.6fr 0.6fr 0.5fr 0.5fr 0.5fr 32px",
+      gap: 5,
+      padding: "7px 14px",
+      fontSize: 8,
+      color: C.textDim,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, /*#__PURE__*/React.createElement("div", null, "Fecha"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, "Entrada"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, "SL"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, "TP"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, "Uds."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, "Riesgo"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, "R:R"), /*#__PURE__*/React.createElement("div", null)), riskTrades.map(t => /*#__PURE__*/React.createElement("div", {
+    key: t.id,
+    className: "row",
+    style: {
+      display: "grid",
+      gridTemplateColumns: "0.8fr 0.6fr 0.6fr 0.6fr 0.5fr 0.5fr 0.5fr 32px",
+      gap: 5,
+      alignItems: "center",
+      padding: "9px 14px",
+      borderBottom: `1px solid ${C.border}`,
+      transition: "background 0.1s"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10
+    }
+  }, t.date), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, fmt(t.entryPrice)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      color: C.red
+    }
+  }, fmt(t.stopLoss)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      color: C.accent
+    }
+  }, t.takeProfit ? fmt(t.takeProfit) : "—"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, t.shares), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      color: C.red
+    }
+  }, fmtEur(t.riskAmount)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      fontWeight: 600,
+      color: t.rr >= 2 ? C.accent : t.rr >= 1 ? C.amber : C.red
+    }
+  }, "1:", fmt(t.rr, 1)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "center"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => removeRiskTrade(t.id),
+    style: {
+      background: "none",
+      border: "none",
+      color: C.textMuted,
+      cursor: "pointer",
+      padding: 3
+    }
+  }, /*#__PURE__*/React.createElement(TrashI, null))))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...cs,
+      marginTop: 14,
+      background: `${C.blue}06`,
+      border: `1px solid ${C.blue}15`
+    }
+  }, /*#__PURE__*/React.createElement("h4", {
+    style: {
+      fontFamily: "'DM Sans',sans-serif",
+      fontSize: 11,
+      margin: "0 0 8px",
+      color: C.blue
+    }
+  }, "Reglas de Gesti\xF3n de Riesgo"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: C.textDim,
+      lineHeight: 1.7
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 4
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.accent,
+      fontWeight: 700
+    }
+  }, "1%"), " \u2014 No arriesgar m\xE1s del 1-2% del capital por operaci\xF3n"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 4
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.accent,
+      fontWeight: 700
+    }
+  }, "1:2"), " \u2014 Ratio riesgo/recompensa m\xEDnimo de 1:2"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 4
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.accent,
+      fontWeight: 700
+    }
+  }, "SL"), " \u2014 Siempre colocar stop loss antes de entrar"), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.accent,
+      fontWeight: 700
+    }
+  }, "5%"), " \u2014 No exponer m\xE1s del 5-6% del capital simult\xE1neamente"))));
+}
+var root=ReactDOM.createRoot(document.getElementById("root"));
+root.render(React.createElement(App));
+  </script>
+</body>
+</html>
